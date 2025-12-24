@@ -2565,6 +2565,11 @@ void SetStatus(HWND hwnd, const std::wstring& text) {
     PostMessageW(hwnd, kMsgUpdateStatus, 0, 0);
 }
 
+void ShowErrorBox(HWND hwnd, const std::wstring& message) {
+    HWND owner = g_status_hwnd ? g_status_hwnd : hwnd;
+    MessageBoxW(owner, message.c_str(), L"u3ware", MB_OK | MB_ICONERROR);
+}
+
 void EnableButton(bool enabled) {
     if (g_button) {
         EnableWindow(g_button, enabled ? TRUE : FALSE);
@@ -2581,6 +2586,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
 
     auto fail_login = [&](const std::wstring& message) -> DWORD {
         SetStatus(hwnd, message);
+        ShowErrorBox(hwnd, message);
         SetStage(UiStage::Login);
         EnableButton(true);
         return 0;
@@ -2588,6 +2594,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
 
     auto fail_dashboard = [&](const std::wstring& message) -> DWORD {
         SetStatus(hwnd, message);
+        ShowErrorBox(hwnd, message);
         SetStage(UiStage::Dashboard);
         EnableButton(true);
         return 0;
@@ -2601,7 +2608,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
 
         std::string hwid = BuildHwid();
         if (hwid.empty()) {
-            return fail_login(L"Failed to build HWID");
+            return fail_login(L"An unknown error occured: D1000001/D1000001"); // Failed to build HWID
         }
         
         // Валидация HWID на спуфинг
@@ -2635,21 +2642,21 @@ DWORD WINAPI WorkerThread(LPVOID param) {
         std::string response;
         std::wstring error;
         if (!HttpRequest(L"POST", g_config.server_url + L"/validate", body, &response, &error)) {
-            return fail_login(L"Server request failed");
+            return fail_login(L"An unknown error occured: D1000002/D1000002"); // Server request failed
         }
         Sleep(RandomDelayMs(1000, 3000));
         SetStatus(hwnd, L"Validating license");
 
         bool ok = false;
         if (!JsonGetBoolTopLevel(response, "ok", &ok)) {
-            return fail_login(L"Invalid server response");
+            return fail_login(L"An unknown error occured: D1000003/D1000003"); // Invalid server response
         }
 
         std::string sig;
         std::string nonce;
         int64_t ts = 0;
         if (!JsonGetStringTopLevel(response, "sig", &sig) || !JsonGetStringTopLevel(response, "nonce", &nonce) || !JsonGetInt64TopLevel(response, "ts", &ts)) {
-            return fail_login(L"Missing response signature");
+            return fail_login(L"An unknown error occured: D1000004/D1000004"); // Missing response signature
         }
 
         int64_t now_ms = GetUnixTimeMs();
@@ -2658,7 +2665,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
             skew_ms = -skew_ms;
         }
         if (skew_ms > 300000) {
-            return fail_login(L"Response timestamp invalid");
+            return fail_login(L"An unknown error occured: D1000005/D1000005"); // Response timestamp invalid
         }
 
         std::string error_code;
@@ -2686,7 +2693,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
         // ANTI_CRACK_CHECK(anti_debug::IsDebuggerDetected());
         
         if (!VerifyResponseSignature(sig_payload, sig, &sig_error)) {
-            return fail_login(sig_error.empty() ? L"Signature invalid" : sig_error);
+            return fail_login(L"An unknown error occured: D1000006/D1000006"); // Signature invalid
         }
         
         // Еще одна проверка после верификации (ВРЕМЕННО ОТКЛЮЧЕНА)
@@ -2694,29 +2701,37 @@ DWORD WINAPI WorkerThread(LPVOID param) {
 
         if (!ok) {
             if (!error_code.empty()) {
+                std::wstring message;
                 if (error_code == "update_required") {
-                    std::wstring message = L"Update required";
-                    if (!min_version.empty()) {
-                        message += L" (min ";
-                        message += Utf8ToWide(min_version);
-                        message += L")";
-                    }
-                    SetStatus(hwnd, message);
+                    message = L"An unknown error occured: D1000014/D1000014"; // Update required
+                } else if (error_code == "invalid_key") {
+                    message = L"An unknown error occured: D200/D200"; // Invalid key
+                } else if (error_code == "expired") {
+                    message = L"An unknown error occured: D200/D200"; // Subscription expired
+                } else if (error_code == "hwid_mismatch") {
+                    message = L"An unknown error occured: D1000015/D1000015"; // Device mismatch
+                } else if (error_code == "no_products") {
+                    message = L"An unknown error occured: D1000016/D1000016"; // No programs on this key
+                } else if (error_code == "missing_key_or_hwid") {
+                    message = L"An unknown error occured: D1000017/D1000017"; // Missing key or device id
+                } else if (error_code == "device_limit") {
+                    message = L"An unknown error occured: D1000018/D1000018"; // Device limit reached
                 } else {
-                    std::wstring friendly = FriendlyErrorMessage(error_code);
-                    SetStatus(hwnd, friendly);
-                    if (error_code == "invalid_key" || error_code == "expired") {
-                        HWND message_owner = g_status_hwnd ? g_status_hwnd : hwnd;
-                        MessageBoxW(message_owner, L"Error: D200 (Invalid or expired key)", L"u3ware", MB_OK | MB_ICONERROR);
-                        if (g_status_hwnd) {
-                            PostMessageW(g_status_hwnd, WM_CLOSE, 0, 0);
-                        }
-                        PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                        return 0;
+                    message = L"An unknown error occured: D1000019/D1000019"; // Unknown server error
+                }
+                SetStatus(hwnd, message);
+                ShowErrorBox(hwnd, message);
+                if (error_code == "invalid_key" || error_code == "expired") {
+                    if (g_status_hwnd) {
+                        PostMessageW(g_status_hwnd, WM_CLOSE, 0, 0);
                     }
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    return 0;
                 }
             } else {
-                SetStatus(hwnd, L"License rejected");
+                std::wstring message = L"An unknown error occured: D1000020/D1000020"; // License rejected
+                SetStatus(hwnd, message);
+                ShowErrorBox(hwnd, message);
             }
             ClearSavedKey();
             g_cached_key.clear();
@@ -2743,7 +2758,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
         }
 
         if (programs.empty()) {
-            return fail_login(L"None selected ");
+            return fail_login(L"An unknown error occured: D1000007/D1000007"); // No programs selected
         }
 
         g_event_token = event_token;
@@ -2772,7 +2787,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     std::wstring error;
     if (!HttpGetBinary(program.dll_url, &dll_bytes, &error)) {
         log_event("download_fail", WideToUtf8(error));
-        return fail_dashboard(L"Internal server error"); //Failed to download DLL
+        return fail_dashboard(L"An unknown error occured: D1000008/D1000008"); // Failed to download DLL
     }
 
     SetStatus(hwnd, L"Verifying build...");
@@ -2798,7 +2813,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     DWORD target_pid = injector::WaitForProcessId(g_config.target_process);
     
     if (target_pid == 0) {
-        return fail_dashboard(L"Target process not found");
+        return fail_dashboard(L"An unknown error occured: D1000009/D1000009"); // Target process not found
     }
     
     // Подготавливаем конфигурацию для DLL через shared memory
@@ -2818,13 +2833,13 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     wcscpy_s(sharedCfg.hwid, hwid_wide.c_str());
     
     if (program.code.length() >= 32) {
-        return fail_dashboard(L"Product code too long");
+        return fail_dashboard(L"An unknown error occured: D1000010/D1000010"); // Product code too long
     }
     wcscpy_s(sharedCfg.product_code, program.code.c_str());
     
     if (!g_event_token.empty()) {
         if (g_event_token.length() >= 512) {
-            return fail_dashboard(L"Event token too long");
+            return fail_dashboard(L"An unknown error occured: D1000011/D1000011"); // Event token too long
         }
         strcpy_s(sharedCfg.event_token, g_event_token.c_str());
     }
@@ -2836,7 +2851,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     HANDLE sharedHandle = shared_config::WriteConfig(target_pid, sharedCfg);
     
     if (!sharedHandle || sharedHandle == INVALID_HANDLE_VALUE) {
-        return fail_dashboard(L"Failed to create shared memory");
+        return fail_dashboard(L"An unknown error occured: D1000012/D1000012"); // Failed to create shared memory
     }
     
     // Затираем локальную копию конфигурации
@@ -2849,7 +2864,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
         // Закрываем shared memory при ошибке
         shared_config::CleanupConfig(sharedHandle);
         log_event("inject_fail", WideToUtf8(inject_result.error));
-        return fail_dashboard(L"An unknown error occured: " + inject_result.error);
+        return fail_dashboard(L"An unknown error occured: D1000013/D1000013"); // Inject failed: inject_result.error
     }
 
     {

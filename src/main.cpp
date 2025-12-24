@@ -82,7 +82,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     InitCommonControlsEx(&icc);
 
     if (!loader::LoadConfig(&loader::g_config)) {
-        MessageBoxW(nullptr, L"Configuration error", L"u3ware", MB_OK | MB_ICONERROR);
+        MessageBoxW(nullptr, L"An unknown error occured: D1000021/D1000021", L"u3ware", MB_OK | MB_ICONERROR); // Configuration error
         return 0;
     }
 
