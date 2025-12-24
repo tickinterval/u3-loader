@@ -2581,6 +2581,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     std::wstring key = args->key;
     TaskType task = args->task;
     ProgramInfo program = args->program;
+    bool is_auto = args->is_auto;
     HWND hwnd = args->hwnd;
     delete args;
 
@@ -2603,7 +2604,11 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     if (task == TaskType::Validate) {
         // Дополнительная проверка на отладчик перед валидацией (ВРЕМЕННО ОТКЛЮЧЕНА)
         // ANTI_CRACK_CHECK(anti_debug::IsDebuggerDetected());
-        
+
+        int validate_attempts = 0;
+    validate_retry:
+        validate_attempts++;
+
         SetStatus(hwnd, L"Connecting");
 
         std::string hwid = BuildHwid();
@@ -2700,9 +2705,17 @@ DWORD WINAPI WorkerThread(LPVOID param) {
         // ANTI_CRACK_CHECK(anti_debug::IsDebuggerDetected());
 
         if (!ok) {
+            bool clear_saved_key = true;
             if (!error_code.empty()) {
                 std::wstring message;
-                if (error_code == "update_required") {
+                if (error_code == "missing_key_or_hwid") {
+                    if (is_auto && validate_attempts < 2) {
+                        Sleep(700);
+                        goto validate_retry;
+                    }
+                    message = L"An unknown error occured: D1000017/D1000017"; // Missing key or device id
+                    clear_saved_key = false;
+                } else if (error_code == "update_required") {
                     message = L"An unknown error occured: D1000014/D1000014"; // Update required
                 } else if (error_code == "invalid_key") {
                     message = L"An unknown error occured: D200/D200"; // Invalid key
@@ -2712,8 +2725,6 @@ DWORD WINAPI WorkerThread(LPVOID param) {
                     message = L"An unknown error occured: D1000015/D1000015"; // Device mismatch
                 } else if (error_code == "no_products") {
                     message = L"An unknown error occured: D1000016/D1000016"; // No programs on this key
-                } else if (error_code == "missing_key_or_hwid") {
-                    message = L"An unknown error occured: D1000017/D1000017"; // Missing key or device id
                 } else if (error_code == "device_limit") {
                     message = L"An unknown error occured: D1000018/D1000018"; // Device limit reached
                 } else {
@@ -2733,8 +2744,10 @@ DWORD WINAPI WorkerThread(LPVOID param) {
                 SetStatus(hwnd, message);
                 ShowErrorBox(hwnd, message);
             }
-            ClearSavedKey();
-            g_cached_key.clear();
+            if (clear_saved_key) {
+                ClearSavedKey();
+                g_cached_key.clear();
+            }
             PostMessageW(hwnd, kMsgProgramsUpdated, 0, 0);
             EnableButton(true);
             return 0;
@@ -3236,7 +3249,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                     SetStage(UiStage::Connecting);
                     SetStatus(hwnd, L"Connecting");
                     EnableButton(false);
-                    WorkerArgs* args = new WorkerArgs{ hwnd, TaskType::Validate, key, {} };
+                    WorkerArgs* args = new WorkerArgs{ hwnd, TaskType::Validate, key, {}, false };
                     CreateThread(nullptr, 0, WorkerThread, args, 0, nullptr);
                     return 0;
                 }
@@ -3259,7 +3272,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 SetStage(UiStage::Loading);
                 SetStatus(hwnd, L"Preparing build");
                 EnableButton(false);
-                WorkerArgs* args = new WorkerArgs{ hwnd, TaskType::LoadProgram, g_cached_key, program };
+                WorkerArgs* args = new WorkerArgs{ hwnd, TaskType::LoadProgram, g_cached_key, program, false };
                 CreateThread(nullptr, 0, WorkerThread, args, 0, nullptr);
             }
             return 0;
@@ -3483,7 +3496,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             SetStatus(hwnd, L"Validating saved key...");
             SetWindowTextW(g_edit, g_cached_key.c_str());
             EnableButton(false);
-            WorkerArgs* args = new WorkerArgs{ hwnd, TaskType::Validate, g_cached_key, {} };
+            WorkerArgs* args = new WorkerArgs{ hwnd, TaskType::Validate, g_cached_key, {}, true };
             CreateThread(nullptr, 0, WorkerThread, args, 0, nullptr);
             return 0;
         }

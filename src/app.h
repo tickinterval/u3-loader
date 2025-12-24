@@ -46,6 +46,7 @@ struct WorkerArgs {
     TaskType task;
     std::wstring key;
     ProgramInfo program;
+    bool is_auto;
 };
 
 extern const COLORREF kBgTop;
