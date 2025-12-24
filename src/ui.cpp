@@ -2733,13 +2733,6 @@ DWORD WINAPI WorkerThread(LPVOID param) {
                 }
                 SetStatus(hwnd, message);
                 ShowErrorBox(hwnd, message);
-                if (error_code == "invalid_key" || error_code == "expired") {
-                    if (g_status_hwnd) {
-                        PostMessageW(g_status_hwnd, WM_CLOSE, 0, 0);
-                    }
-                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                    return 0;
-                }
             } else {
                 std::wstring message = L"An unknown error occured: D1000020/D1000020"; // License rejected
                 SetStatus(hwnd, message);
