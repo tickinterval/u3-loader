@@ -46,6 +46,7 @@ static std::unordered_map<std::wstring, int> g_avatar_index;
 static std::vector<HBITMAP> g_avatar_bitmaps;
 static bool g_gdiplus_started = false;
 static ULONG_PTR g_gdiplus_token = 0;
+static bool g_ignore_key_change = false;
 
 constexpr UINT kUiTimerId = 1;
 constexpr BYTE kFadeStep = 18;
@@ -3228,6 +3229,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         }
         case WM_COMMAND:
             if (LOWORD(wparam) == kControlIdEdit && HIWORD(wparam) == EN_CHANGE) {
+                if (g_ignore_key_change) {
+                    return 0;
+                }
                 if (g_stage != UiStage::Login) {
                     SetStage(UiStage::Login);
                     ResetPrograms();
@@ -3492,11 +3496,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             if (g_cached_key.empty()) {
                 return 0;
             }
+            std::wstring saved_key = g_cached_key;
             SetStage(UiStage::Connecting);
             SetStatus(hwnd, L"Validating saved key...");
-            SetWindowTextW(g_edit, g_cached_key.c_str());
+            g_ignore_key_change = true;
+            SetWindowTextW(g_edit, saved_key.c_str());
+            g_ignore_key_change = false;
             EnableButton(false);
-            WorkerArgs* args = new WorkerArgs{ hwnd, TaskType::Validate, g_cached_key, {}, true };
+            WorkerArgs* args = new WorkerArgs{ hwnd, TaskType::Validate, saved_key, {}, true };
             CreateThread(nullptr, 0, WorkerThread, args, 0, nullptr);
             return 0;
         }
