@@ -30,9 +30,13 @@ python encrypt_key.py
 ```
 cmake -S . -B build -A Win32
 cmake --build build --config Release
+```
+If you are not using Themida/VMProtect and want the built-in integrity check, define
+`U3_ENABLE_INTEGRITY_CHECK` and run:
+```
 python compute_hash.py build/Release/loader.exe
 ```
-The hash patch step is required; it embeds the integrity hash into the binary.
+Do not run `compute_hash.py` on a protected binary; it will invalidate the packer.
 
 ## Deploy on PC
 - Distribute `build/Release/loader.exe` to users.
@@ -40,13 +44,17 @@ The hash patch step is required; it embeds the integrity hash into the binary.
 
 ## Release checklist (PC)
 1) Update `kLoaderVersion` in `loader/src/app_state.cpp`.
-2) Build and patch the integrity hash:
+2) Build the release binary:
 ```
 cmake -S . -B build -A Win32
 cmake --build build --config Release
+```
+3) If using Themida/VMProtect, pack the EXE now and do not run `compute_hash.py` after packing.
+4) If using the built-in integrity check, define `U3_ENABLE_INTEGRITY_CHECK` and run:
+```
 python compute_hash.py build/Release/loader.exe
 ```
-3) Upload `loader.exe` to the server `update_path`.
-4) Update `update_version` (and `min_loader_version` if needed) in `server/config.json`, then restart the server.
-5) If TLS cert changed, update `kDefaultExpectedThumbprint` and rebuild.
-6) If response signing keys changed, regenerate `kEncryptedResponseKey` via `encrypt_key.py`.
+5) Upload `loader.exe` to the server `update_path`.
+6) Update `update_version` (and `min_loader_version` if needed) in `server/config.json`, then restart the server.
+7) If TLS cert changed, update `kDefaultExpectedThumbprint` and rebuild.
+8) If response signing keys changed, regenerate `kEncryptedResponseKey` via `encrypt_key.py`.

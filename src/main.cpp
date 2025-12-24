@@ -55,10 +55,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     
     // 8. Проверка целостности (отключена для разработки)
     // ВАЖНО: Для production используйте VMProtect/Themida с опцией "Integrity Check"
+    // Optional internal integrity check; disable when using external packer integrity.
+#if defined(U3_ENABLE_INTEGRITY_CHECK)
     if (!loader::protection::VerifyIntegrity()) {
         ANTI_CRACK_EXIT();
         return 0;
     }
+#endif
     
     // ============================================
     
