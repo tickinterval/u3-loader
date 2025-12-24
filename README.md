@@ -37,3 +37,16 @@ The hash patch step is required; it embeds the integrity hash into the binary.
 ## Deploy on PC
 - Distribute `build/Release/loader.exe` to users.
 - When you release a new build, copy the EXE to the server `update_path` and bump `update_version` in `server/config.json`.
+
+## Release checklist (PC)
+1) Update `kLoaderVersion` in `loader/src/app_state.cpp`.
+2) Build and patch the integrity hash:
+```
+cmake -S . -B build -A Win32
+cmake --build build --config Release
+python compute_hash.py build/Release/loader.exe
+```
+3) Upload `loader.exe` to the server `update_path`.
+4) Update `update_version` (and `min_loader_version` if needed) in `server/config.json`, then restart the server.
+5) If TLS cert changed, update `kDefaultExpectedThumbprint` and rebuild.
+6) If response signing keys changed, regenerate `kEncryptedResponseKey` via `encrypt_key.py`.
