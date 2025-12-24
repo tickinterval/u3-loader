@@ -361,6 +361,55 @@ std::string JsonEscape(const std::string& input) {
     return out;
 }
 
+std::string TrimTrailingZeros(std::string value) {
+    size_t dot = value.find('.');
+    if (dot == std::string::npos) {
+        return value;
+    }
+    while (!value.empty() && value.back() == '0') {
+        value.pop_back();
+    }
+    if (!value.empty() && value.back() == '.') {
+        value.pop_back();
+    }
+    return value;
+}
+
+void AppendJsonStringField(std::string* out, const char* key, const std::string& value) {
+    if (!out || value.empty()) {
+        return;
+    }
+    *out += ",\"";
+    *out += key;
+    *out += "\":\"";
+    *out += JsonEscape(value);
+    *out += "\"";
+}
+
+void AppendJsonIntField(std::string* out, const char* key, int value) {
+    if (!out || value <= 0) {
+        return;
+    }
+    *out += ",\"";
+    *out += key;
+    *out += "\":";
+    *out += std::to_string(value);
+}
+
+void AppendJsonNumberField(std::string* out, const char* key, double value) {
+    if (!out || value <= 0.0) {
+        return;
+    }
+    std::string text = TrimTrailingZeros(std::to_string(value));
+    if (text.empty()) {
+        return;
+    }
+    *out += ",\"";
+    *out += key;
+    *out += "\":";
+    *out += text;
+}
+
 std::wstring GetMachineGuid() {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography", 0, KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
@@ -483,6 +532,104 @@ std::wstring GetComputerNameSafe() {
         return std::wstring(name);
     }
     return L"";
+}
+
+std::wstring GetArchName() {
+    SYSTEM_INFO info = {};
+    GetNativeSystemInfo(&info);
+    switch (info.wProcessorArchitecture) {
+        case PROCESSOR_ARCHITECTURE_AMD64:
+            return L"x64";
+        case PROCESSOR_ARCHITECTURE_INTEL:
+            return L"x86";
+        case PROCESSOR_ARCHITECTURE_ARM64:
+            return L"arm64";
+        case PROCESSOR_ARCHITECTURE_ARM:
+            return L"arm";
+        case PROCESSOR_ARCHITECTURE_IA64:
+            return L"ia64";
+        default:
+            return L"unknown";
+    }
+}
+
+int GetCpuCoreCount() {
+    SYSTEM_INFO info = {};
+    GetNativeSystemInfo(&info);
+    if (info.dwNumberOfProcessors > 0) {
+        return static_cast<int>(info.dwNumberOfProcessors);
+    }
+    return 0;
+}
+
+double GetTotalRamGb() {
+    MEMORYSTATUSEX status = {};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status)) {
+        return 0.0;
+    }
+    return static_cast<double>(status.ullTotalPhys) / (1024.0 * 1024.0 * 1024.0);
+}
+
+double GetSystemDiskGb() {
+    wchar_t system_path[MAX_PATH] = {};
+    if (!GetSystemDirectoryW(system_path, MAX_PATH)) {
+        return 0.0;
+    }
+    if (system_path[0] == L'\0' || system_path[1] != L':') {
+        return 0.0;
+    }
+    wchar_t root_path[4] = { system_path[0], system_path[1], L'\\', L'\0' };
+    ULARGE_INTEGER total = {};
+    if (!GetDiskFreeSpaceExW(root_path, nullptr, &total, nullptr)) {
+        return 0.0;
+    }
+    return static_cast<double>(total.QuadPart) / (1024.0 * 1024.0 * 1024.0);
+}
+
+std::wstring GetLocaleNameSafe() {
+    wchar_t locale[LOCALE_NAME_MAX_LENGTH] = {};
+    if (GetUserDefaultLocaleName(locale, LOCALE_NAME_MAX_LENGTH)) {
+        return std::wstring(locale);
+    }
+    wchar_t fallback[128] = {};
+    if (GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_SNAME, fallback, 128) > 0) {
+        return std::wstring(fallback);
+    }
+    return L"";
+}
+
+std::wstring FormatUtcOffsetMinutes(LONG bias_minutes) {
+    int offset = -static_cast<int>(bias_minutes);
+    wchar_t sign = offset >= 0 ? L'+' : L'-';
+    offset = abs(offset);
+    int hours = offset / 60;
+    int minutes = offset % 60;
+    wchar_t buffer[16] = {};
+    swprintf_s(buffer, L"UTC%c%02d:%02d", sign, hours, minutes);
+    return std::wstring(buffer);
+}
+
+std::wstring GetTimezoneName() {
+    TIME_ZONE_INFORMATION info = {};
+    DWORD id = GetTimeZoneInformation(&info);
+    LONG bias = info.Bias;
+    if (id == TIME_ZONE_ID_DAYLIGHT) {
+        bias += info.DaylightBias;
+    } else if (id == TIME_ZONE_ID_STANDARD) {
+        bias += info.StandardBias;
+    }
+    std::wstring name;
+    if (id == TIME_ZONE_ID_DAYLIGHT && info.DaylightName[0]) {
+        name = info.DaylightName;
+    } else if (info.StandardName[0]) {
+        name = info.StandardName;
+    }
+    std::wstring offset = FormatUtcOffsetMinutes(bias);
+    if (!name.empty()) {
+        return name + L" (" + offset + L")";
+    }
+    return offset;
 }
 
 std::string Sha256Hex(const std::string& data) {
@@ -1094,6 +1241,41 @@ bool CheckForUpdateSilent() {
     return true;
 }
 
+void AppendDeviceInfoFields(std::string* body) {
+    if (!body) {
+        return;
+    }
+    std::string cpu = WideToUtf8(GetCpuName());
+    std::string gpu = WideToUtf8(GetGpuName());
+    std::string build = WideToUtf8(GetWindowsBuild());
+    std::string os = WideToUtf8(GetOsVersion());
+    std::string name = WideToUtf8(GetComputerNameSafe());
+    std::string arch = WideToUtf8(GetArchName());
+    int cores = GetCpuCoreCount();
+    double ram_gb = GetTotalRamGb();
+    double disk_gb = GetSystemDiskGb();
+    std::string locale = WideToUtf8(GetLocaleNameSafe());
+    std::string timezone = WideToUtf8(GetTimezoneName());
+    std::string bios = WideToUtf8(GetBiosSerial());
+    std::string board = WideToUtf8(GetBaseBoardSerial());
+    std::string smbios = WideToUtf8(GetSmbiosUuid());
+
+    AppendJsonStringField(body, "device_cpu", cpu);
+    AppendJsonStringField(body, "device_gpu", gpu);
+    AppendJsonStringField(body, "device_build", build);
+    AppendJsonStringField(body, "device_os", os);
+    AppendJsonStringField(body, "device_name", name);
+    AppendJsonStringField(body, "device_arch", arch);
+    AppendJsonIntField(body, "device_cores", cores);
+    AppendJsonNumberField(body, "device_ram_gb", ram_gb);
+    AppendJsonNumberField(body, "device_disk_gb", disk_gb);
+    AppendJsonStringField(body, "device_locale", locale);
+    AppendJsonStringField(body, "device_timezone", timezone);
+    AppendJsonStringField(body, "device_bios", bios);
+    AppendJsonStringField(body, "device_board", board);
+    AppendJsonStringField(body, "device_smbios", smbios);
+}
+
 void SendEvent(const std::wstring& server_url,
                const std::wstring& key,
                const std::string& hwid,
@@ -1102,22 +1284,14 @@ void SendEvent(const std::wstring& server_url,
                const std::string& detail) {
     std::string key_utf8 = WideToUtf8(key);
     std::string code_utf8 = WideToUtf8(product_code);
-    std::string cpu = WideToUtf8(GetCpuName());
-    std::string gpu = WideToUtf8(GetGpuName());
-    std::string build = WideToUtf8(GetWindowsBuild());
-    std::string os = WideToUtf8(GetOsVersion());
-    std::string name = WideToUtf8(GetComputerNameSafe());
     if (g_event_token.empty()) {
         return;
     }
     std::string body = "{\"key\":\"" + JsonEscape(key_utf8) + "\",\"hwid\":\"" + JsonEscape(hwid) +
         "\",\"type\":\"" + JsonEscape(event_type) + "\",\"product_code\":\"" + JsonEscape(code_utf8) +
-        "\",\"detail\":\"" + JsonEscape(detail) + "\",\"token\":\"" + JsonEscape(g_event_token) +
-        "\",\"device_cpu\":\"" + JsonEscape(cpu) +
-        "\",\"device_gpu\":\"" + JsonEscape(gpu) +
-        "\",\"device_build\":\"" + JsonEscape(build) +
-        "\",\"device_os\":\"" + JsonEscape(os) +
-        "\",\"device_name\":\"" + JsonEscape(name) + "\"}";
+        "\",\"detail\":\"" + JsonEscape(detail) + "\",\"token\":\"" + JsonEscape(g_event_token) + "\"";
+    AppendDeviceInfoFields(&body);
+    body += "}";
     std::string response;
     std::wstring error;
     HttpRequest(L"POST", server_url + L"/event", body, &response, &error);
@@ -2621,11 +2795,6 @@ DWORD WINAPI WorkerThread(LPVOID param) {
         auto hwid_validation = hwid_validator::ValidateHWID();
         
         std::string key_utf8 = WideToUtf8(key);
-        std::string cpu = WideToUtf8(GetCpuName());
-        std::string gpu = WideToUtf8(GetGpuName());
-        std::string build = WideToUtf8(GetWindowsBuild());
-        std::string os = WideToUtf8(GetOsVersion());
-        std::string name = WideToUtf8(GetComputerNameSafe());
         
         // Формируем JSON с флагами валидации
         std::string flags_json = "[";
@@ -2636,13 +2805,9 @@ DWORD WINAPI WorkerThread(LPVOID param) {
         flags_json += "]";
         
         std::string body = "{\"key\":\"" + JsonEscape(key_utf8) + "\",\"hwid\":\"" + JsonEscape(hwid) +
-            "\",\"version\":\"" + std::string(kLoaderVersion) +
-            "\",\"device_cpu\":\"" + JsonEscape(cpu) +
-            "\",\"device_gpu\":\"" + JsonEscape(gpu) +
-            "\",\"device_build\":\"" + JsonEscape(build) +
-            "\",\"device_os\":\"" + JsonEscape(os) +
-            "\",\"device_name\":\"" + JsonEscape(name) +
-            "\",\"hwid_score\":" + std::to_string(hwid_validation.suspicion_score) +
+            "\",\"version\":\"" + std::string(kLoaderVersion) + "\"";
+        AppendDeviceInfoFields(&body);
+        body += ",\"hwid_score\":" + std::to_string(hwid_validation.suspicion_score) +
             ",\"hwid_flags\":" + flags_json + "}";
 
         std::string response;
@@ -2719,9 +2884,9 @@ DWORD WINAPI WorkerThread(LPVOID param) {
                 } else if (error_code == "update_required") {
                     message = L"An unknown error occured: D1000014/D1000014"; // Update required
                 } else if (error_code == "invalid_key") {
-                    message = L"An unknown error occured: D200/D200"; // Invalid key
+                    message = L"An unknown error occured: D2000011/D2000012"; // Invalid key
                 } else if (error_code == "expired") {
-                    message = L"An unknown error occured: D200/D200"; // Subscription expired
+                    message = L"An unknown error occured: D2000011/D2000013"; // Subscription expired
                 } else if (error_code == "hwid_mismatch") {
                     message = L"An unknown error occured: D1000015/D1000015"; // Device mismatch
                 } else if (error_code == "no_products") {
