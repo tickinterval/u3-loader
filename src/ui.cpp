@@ -5,6 +5,7 @@
 #include "anti_crack.h"
 #include "shared_config.h"
 #include "hwid_validator.h"
+#include "process_info.h"
 #include <winhttp.h>
 #include <wincrypt.h>
 #include <wintrust.h>
@@ -2947,46 +2948,120 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     }
 
     Sleep(RandomDelayMs(1000, 3000));
-    std::wstring download_status = L"Downloading " + (program.name.empty() ? std::wstring(L"build") : program.name) + L"...";
-    SetStatus(hwnd, download_status);
     std::string hwid_event = BuildHwid();
     auto log_event = [&](const std::string& type, const std::string& detail) {
         if (!g_cached_key.empty() && !hwid_event.empty()) {
             SendEvent(g_config.server_url, g_cached_key, hwid_event, program.code, type, detail);
         }
     };
-    std::vector<char> dll_bytes;
+    
+    // Сначала находим процесс игры для сбора информации
+    SetStatus(hwnd, L"Waiting for game");
+    Sleep(RandomDelayMs(500, 1000));
+    
+    DWORD target_pid = injector::WaitForProcessId(g_config.target_process);
+    if (target_pid == 0) {
+        return fail_dashboard(L"An unknown error occured: D1000009/D1000009"); // Target process not found
+    }
+    
+    // Собираем информацию о процессе для защиты
+    SetStatus(hwnd, L"Analyzing process...");
+    process_info::ProcessInfo proc_info = {};
+    if (!process_info::CollectProcessInfo(target_pid, &proc_info)) {
+        log_event("process_info_fail", "failed_to_collect");
+        return fail_dashboard(L"An unknown error occured: D1000014/D1000014"); // Failed to collect process info
+    }
+    
+    // Отправляем информацию на сервер для получения уникальной DLL
+    SetStatus(hwnd, L"Requesting secure build...");
+    std::string process_info_json = process_info::ProcessInfoToJson(proc_info);
+    
+    // Проверяем наличие event_token
+    if (g_event_token.empty()) {
+        log_event("request_dll_fail", "missing_event_token");
+        return fail_dashboard(L"An unknown error occured: D1000028/D1000028"); // Missing event token
+    }
+    
+    // Формируем запрос на сервер
+    std::string request_body = "{\"token\":\"" + JsonEscape(g_event_token) + 
+                               "\",\"product_code\":\"" + JsonEscape(WideToUtf8(program.code)) +
+                               "\",\"process_info\":" + process_info_json + "}";
+    
+    std::string response;
     std::wstring error;
-    if (!HttpGetBinary(program.dll_url, &dll_bytes, &error)) {
+    std::wstring request_url = g_config.server_url + L"/request-dll";
+    
+    if (!HttpRequest(L"POST", request_url, request_body, &response, &error)) {
+        log_event("request_dll_fail", WideToUtf8(error));
+        return fail_dashboard(L"An unknown error occured: D1000015/D1000015"); // Failed to request DLL
+    }
+    
+    // Парсим ответ - получаем уникальный URL для скачивания
+    std::string dll_url_utf8;
+    std::string dll_sha256;
+    bool ok = false;
+    
+    // Сначала пытаемся получить ok
+    JsonGetBoolTopLevel(response, "ok", &ok);
+    
+    if (!ok) {
+        std::string error_msg;
+        JsonGetStringTopLevel(response, "error", &error_msg);
+        log_event("request_dll_fail", error_msg.empty() ? "invalid_response" : error_msg);
+        
+        // Показываем более информативное сообщение об ошибке
+        if (error_msg == "invalid_token") {
+            return fail_dashboard(L"An unknown error occured: D1000020/D1000020"); // Invalid token
+        } else if (error_msg == "invalid_key") {
+            return fail_dashboard(L"An unknown error occured: D1000021/D1000021"); // Invalid key
+        } else if (error_msg == "hwid_mismatch") {
+            return fail_dashboard(L"An unknown error occured: D1000022/D1000022"); // HWID mismatch
+        } else if (error_msg == "expired") {
+            return fail_dashboard(L"An unknown error occured: D1000023/D1000023"); // Expired
+        } else if (error_msg == "missing_fields") {
+            return fail_dashboard(L"An unknown error occured: D1000024/D1000024"); // Missing fields
+        } else if (error_msg == "missing_payload") {
+            return fail_dashboard(L"An unknown error occured: D1000025/D1000025"); // Missing payload
+        } else if (error_msg == "protection_failed") {
+            return fail_dashboard(L"An unknown error occured: D1000026/D1000026"); // Protection failed
+        } else if (error_msg == "build_failed") {
+            return fail_dashboard(L"An unknown error occured: D1000027/D1000027"); // Build failed
+        }
+        
+        return fail_dashboard(L"An unknown error occured: D1000016/D1000016"); // Invalid server response
+    }
+    
+    if (!JsonGetStringTopLevel(response, "dll_url", &dll_url_utf8) || 
+        !JsonGetStringTopLevel(response, "dll_sha256", &dll_sha256)) {
+        log_event("request_dll_fail", "missing_url_or_hash");
+        return fail_dashboard(L"An unknown error occured: D1000017/D1000017"); // Missing DLL URL or hash
+    }
+    
+    // Скачиваем уникальную DLL
+    std::wstring download_status = L"Downloading " + (program.name.empty() ? std::wstring(L"build") : program.name) + L"...";
+    SetStatus(hwnd, download_status);
+    
+    std::vector<char> dll_bytes;
+    std::wstring dll_url_wide = Utf8ToWide(dll_url_utf8);
+    if (!HttpGetBinary(dll_url_wide, &dll_bytes, &error)) {
         log_event("download_fail", WideToUtf8(error));
         return fail_dashboard(L"An unknown error occured: D1000008/D1000008"); // Failed to download DLL
     }
 
     SetStatus(hwnd, L"Verifying build...");
-    if (program.payload_sha256.empty()) {
+    if (dll_sha256.empty()) {
         log_event("verify_fail", "missing_hash");
         return fail_dashboard(L"An unknown error occured: D00013FF/D00013FF"); //Missing build hash
     }
-    std::wstring expected_hash = ToLowerString(program.payload_sha256);
+    std::wstring expected_hash = ToLowerString(Utf8ToWide(dll_sha256));
     std::wstring actual_hash = ToLowerString(Utf8ToWide(Sha256HexBytes(dll_bytes)));
     if (expected_hash != actual_hash) {
         log_event("verify_fail", "hash_mismatch");
         return fail_dashboard(L"An unknown error occured: D00BAD01/D00BAD01"); //Build hash mismatch
     }
 
-    SetStatus(hwnd, L"[U] Loading..."); //Payload verified
+    SetStatus(hwnd, L"Loading..."); //Payload verified
     Sleep(RandomDelayMs(500, 1500));
-
-    // Инжект DLL в целевой процесс
-    SetStatus(hwnd, L"Waiting for game"); //Searching target process...
-    Sleep(RandomDelayMs(500, 1000));
-
-    // Ожидаем появления целевого процесса
-    DWORD target_pid = injector::WaitForProcessId(g_config.target_process);
-    
-    if (target_pid == 0) {
-        return fail_dashboard(L"An unknown error occured: D1000009/D1000009"); // Target process not found
-    }
     
     // Подготавливаем конфигурацию для DLL через shared memory
     shared_config::SharedConfig sharedCfg = {};
@@ -3045,7 +3120,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
         }
     }
 
-    SetStatus(hwnd, L"[U] Initialization");
+    SetStatus(hwnd, L"Initialization");
     Sleep(2000);
     
     // Закрываем shared memory (DLL уже прочитала данные)

@@ -60,3 +60,4 @@ if __name__ == "__main__":
 
     print(hash_value)
     print(f"\n// Hash patched into {sys.argv[1]}", file=sys.stderr)
+

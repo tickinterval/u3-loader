@@ -21,7 +21,7 @@ const COLORREF kAccentAlt = RGB(90, 160, 255);
 const COLORREF kMutedColor = RGB(148, 158, 172);
 const COLORREF kMaskColor = RGB(255, 0, 255);
 
-const char kLoaderVersion[] = "1.2.0";
+const char kLoaderVersion[] = "1.2.2";
 const wchar_t kDefaultServerUrl[] = L"https://u3.llvm.uk";
 const wchar_t kDefaultExpectedThumbprint[] = L"3BB5AD9A07C169E665AA8777EC428487032CC3D4";
 const wchar_t kDefaultUserAgent[] = L"u3ware/1.0";

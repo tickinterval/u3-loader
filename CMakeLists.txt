@@ -12,9 +12,10 @@ add_executable(loader WIN32
     src/anti_debug.cpp
     src/protection.cpp
     src/hwid_validator.cpp
+    src/process_info.cpp
     # anti_crack.h - header only
 )
 
 target_compile_definitions(loader PRIVATE UNICODE _UNICODE)
 
-target_link_libraries(loader PRIVATE winhttp crypt32 wintrust comctl32 msimg32 ntdll)
+target_link_libraries(loader PRIVATE winhttp crypt32 wintrust comctl32 msimg32 ntdll psapi)
