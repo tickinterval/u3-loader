@@ -16,6 +16,6 @@ add_executable(loader WIN32
     # anti_crack.h - header only
 )
 
-target_compile_definitions(loader PRIVATE UNICODE _UNICODE)
+target_compile_definitions(loader PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
 
-target_link_libraries(loader PRIVATE winhttp crypt32 wintrust comctl32 msimg32 ntdll psapi)
+target_link_libraries(loader PRIVATE ws2_32 advapi32 bcrypt crypt32 secur32 wintrust comctl32 msimg32 ntdll psapi)

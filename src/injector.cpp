@@ -1,5 +1,6 @@
 #include "injector.h"
 #include <tlhelp32.h>
+#include <wincrypt.h>
 #include <vector>
 #include <cstring>
 
@@ -14,6 +15,8 @@
 
 namespace loader {
 namespace injector {
+
+using NTSTATUS = LONG;
 
 // ================== ENCRYPTION ==================
 

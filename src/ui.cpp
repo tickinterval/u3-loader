@@ -6,9 +6,16 @@
 #include "shared_config.h"
 #include "hwid_validator.h"
 #include "process_info.h"
-#include <winhttp.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <bcrypt.h>
 #include <wincrypt.h>
 #include <wintrust.h>
+#ifndef SECURITY_WIN32
+#define SECURITY_WIN32
+#endif
+#include <security.h>
+#include <schannel.h>
 #include <softpub.h>
 #include <windowsx.h>
 #include <shlobj.h>
@@ -20,8 +27,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <unordered_map>
+#include <mutex>
 
-#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "msimg32.lib")
@@ -37,7 +44,6 @@ bool JsonGetStringTopLevel(const std::string& json, const std::string& key, std:
 bool JsonGetInt64TopLevel(const std::string& json, const std::string& key, int64_t* value);
 bool VerifyResponseSignature(const std::string& payload, const std::string& signature_b64, std::wstring* error);
 std::wstring BytesToHexUpper(const BYTE* bytes, DWORD size);
-bool VerifyServerCertificatePin(HINTERNET request, const std::wstring& expected_thumbprint, std::wstring* error);
 bool HttpGetBinary(const std::wstring& url, std::vector<char>* out, std::wstring* error);
 bool WriteFileBinary(const std::wstring& path, const std::vector<char>& data);
 std::string Sha256HexBytes(const std::vector<char>& data);
@@ -944,42 +950,623 @@ std::string Sha256HexBytes(const std::vector<char>& data) {
     return out;
 }
 
-struct UrlParts {
+struct TcpUrlParts {
     std::wstring host;
+    std::wstring port;
     std::wstring path;
-    INTERNET_PORT port;
-    bool secure;
+    bool use_tls = false;
 };
 
-bool CrackUrl(const std::wstring& url, UrlParts* out, std::wstring* error) {
-    URL_COMPONENTS components = {};
-    components.dwStructSize = sizeof(components);
-    components.dwSchemeLength = static_cast<DWORD>(-1);
-    components.dwHostNameLength = static_cast<DWORD>(-1);
-    components.dwUrlPathLength = static_cast<DWORD>(-1);
-    components.dwExtraInfoLength = static_cast<DWORD>(-1);
+namespace {
+constexpr DWORD kTcpTimeoutMs = 15000;
+constexpr uint32_t kTcpMaxResponseBytes = 50u * 1024u * 1024u;
+std::once_flag g_winsock_once;
+bool g_winsock_ready = false;
 
-    std::wstring url_copy = url;
-    if (!WinHttpCrackUrl(url_copy.data(), static_cast<DWORD>(url_copy.size()), 0, &components)) {
+void InitWinsock() {
+    WSADATA wsa = {};
+    g_winsock_ready = (WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+}
+
+bool EnsureWinsock(std::wstring* error) {
+    std::call_once(g_winsock_once, InitWinsock);
+    if (!g_winsock_ready) {
         if (error) {
-            *error = L"Failed to parse URL";
+            *error = L"Failed to initialize Winsock";
         }
         return false;
-    }
-
-    out->secure = components.nScheme == INTERNET_SCHEME_HTTPS;
-    out->port = components.nPort;
-    out->host.assign(components.lpszHostName, components.dwHostNameLength);
-    out->path.assign(components.lpszUrlPath, components.dwUrlPathLength);
-    if (components.dwExtraInfoLength > 0) {
-        out->path.append(components.lpszExtraInfo, components.dwExtraInfoLength);
-    }
-    if (out->path.empty()) {
-        out->path = L"/";
     }
     return true;
 }
 
+bool SendAll(SOCKET sock, const char* data, size_t size, std::wstring* error) {
+    size_t sent_total = 0;
+    while (sent_total < size) {
+        int sent = send(sock, data + sent_total, static_cast<int>(size - sent_total), 0);
+        if (sent == SOCKET_ERROR) {
+            if (error) {
+                DWORD win_error = WSAGetLastError();
+                wchar_t buf[256];
+                swprintf_s(buf, L"Socket send failed (err: %lu)", win_error);
+                *error = buf;
+            }
+            return false;
+        }
+        if (sent == 0) {
+            break;
+        }
+        sent_total += static_cast<size_t>(sent);
+    }
+    return sent_total == size;
+}
+
+bool RecvAll(SOCKET sock, char* data, size_t size, std::wstring* error) {
+    size_t received_total = 0;
+    while (received_total < size) {
+        int received = recv(sock, data + received_total, static_cast<int>(size - received_total), 0);
+        if (received == SOCKET_ERROR) {
+            if (error) {
+                DWORD win_error = WSAGetLastError();
+                wchar_t buf[256];
+                swprintf_s(buf, L"Socket receive failed (err: %lu)", win_error);
+                *error = buf;
+            }
+            return false;
+        }
+        if (received == 0) {
+            if (error) {
+                *error = L"Connection closed unexpectedly";
+            }
+            return false;
+        }
+        received_total += static_cast<size_t>(received);
+    }
+    return true;
+}
+
+struct TlsConnection {
+    SOCKET sock = INVALID_SOCKET;
+    CredHandle cred = {};
+    CtxtHandle ctxt = {};
+    SecPkgContext_StreamSizes sizes = {};
+    bool ready = false;
+    std::vector<char> enc_buffer;
+    std::vector<char> dec_buffer;
+    size_t dec_offset = 0;
+};
+
+bool RecvSome(SOCKET sock, std::vector<char>* buffer, std::wstring* error) {
+    char temp[4096];
+    int received = recv(sock, temp, sizeof(temp), 0);
+    if (received == SOCKET_ERROR) {
+        if (error) {
+            DWORD win_error = WSAGetLastError();
+            wchar_t buf[256];
+            swprintf_s(buf, L"Socket receive failed (err: %lu)", win_error);
+            *error = buf;
+        }
+        return false;
+    }
+    if (received == 0) {
+        if (error) {
+            *error = L"Connection closed unexpectedly";
+        }
+        return false;
+    }
+    buffer->insert(buffer->end(), temp, temp + received);
+    return true;
+}
+
+bool VerifyServerThumbprint(PCCERT_CONTEXT cert, const std::wstring& expected_thumbprint, std::wstring* error) {
+    if (expected_thumbprint.empty()) {
+        return true;
+    }
+
+    BYTE hash[32] = {};
+    DWORD hash_size = sizeof(hash);
+    DWORD prop_id = CERT_SHA256_HASH_PROP_ID;
+    if (!CertGetCertificateContextProperty(cert, prop_id, hash, &hash_size)) {
+        prop_id = CERT_SHA1_HASH_PROP_ID;
+        hash_size = sizeof(hash);
+        if (!CertGetCertificateContextProperty(cert, prop_id, hash, &hash_size)) {
+            if (error) {
+                *error = L"Failed to read certificate hash";
+            }
+            return false;
+        }
+    }
+
+    std::wstring actual = BytesToHexUpper(hash, hash_size);
+    std::wstring expected = NormalizeThumbprint(expected_thumbprint);
+    if (actual != expected) {
+        if (error) {
+            *error = L"Certificate thumbprint mismatch";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool TlsHandshake(SOCKET sock,
+                  const std::wstring& host,
+                  const std::wstring& expected_thumbprint,
+                  TlsConnection* out,
+                  std::wstring* error) {
+    if (!out) {
+        return false;
+    }
+
+    bool manual_validation = !expected_thumbprint.empty();
+    SCHANNEL_CRED cred = {};
+    cred.dwVersion = SCHANNEL_CRED_VERSION;
+    cred.dwFlags = SCH_USE_STRONG_CRYPTO;
+    if (manual_validation) {
+        cred.dwFlags |= SCH_CRED_MANUAL_CRED_VALIDATION | SCH_CRED_NO_SERVERNAME_CHECK;
+    }
+
+    TimeStamp expiry = {};
+    SECURITY_STATUS status = AcquireCredentialsHandleW(
+        nullptr,
+        const_cast<wchar_t*>(UNISP_NAME),
+        SECPKG_CRED_OUTBOUND,
+        nullptr,
+        &cred,
+        nullptr,
+        nullptr,
+        &out->cred,
+        &expiry);
+    if (status != SEC_E_OK) {
+        if (error) {
+            *error = L"TLS credential initialization failed";
+        }
+        return false;
+    }
+
+    DWORD ctx_req = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT | ISC_REQ_CONFIDENTIALITY |
+                    ISC_REQ_EXTENDED_ERROR | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM;
+    if (manual_validation) {
+        ctx_req |= ISC_REQ_MANUAL_CRED_VALIDATION;
+    }
+    DWORD ctx_attr = 0;
+
+    SecBuffer out_buffer = {};
+    out_buffer.BufferType = SECBUFFER_TOKEN;
+    SecBufferDesc out_desc = {};
+    out_desc.ulVersion = SECBUFFER_VERSION;
+    out_desc.cBuffers = 1;
+    out_desc.pBuffers = &out_buffer;
+
+    status = InitializeSecurityContextW(
+        &out->cred,
+        nullptr,
+        host.empty() ? nullptr : const_cast<wchar_t*>(host.c_str()),
+        ctx_req,
+        0,
+        0,
+        nullptr,
+        0,
+        &out->ctxt,
+        &out_desc,
+        &ctx_attr,
+        nullptr);
+
+    if (status != SEC_I_CONTINUE_NEEDED && status != SEC_E_OK) {
+        if (error) {
+            *error = L"TLS handshake failed";
+        }
+        FreeCredentialsHandle(&out->cred);
+        return false;
+    }
+
+    if (out_buffer.cbBuffer && out_buffer.pvBuffer) {
+        bool sent = SendAll(sock, reinterpret_cast<const char*>(out_buffer.pvBuffer), out_buffer.cbBuffer, error);
+        FreeContextBuffer(out_buffer.pvBuffer);
+        out_buffer.pvBuffer = nullptr;
+        if (!sent) {
+            FreeCredentialsHandle(&out->cred);
+            return false;
+        }
+    }
+
+    std::vector<char> in_buffer;
+    while (status == SEC_I_CONTINUE_NEEDED || status == SEC_E_INCOMPLETE_MESSAGE ||
+           status == SEC_I_COMPLETE_NEEDED || status == SEC_I_COMPLETE_AND_CONTINUE) {
+        if (status == SEC_E_INCOMPLETE_MESSAGE || in_buffer.empty()) {
+            if (!RecvSome(sock, &in_buffer, error)) {
+                DeleteSecurityContext(&out->ctxt);
+                FreeCredentialsHandle(&out->cred);
+                return false;
+            }
+        }
+
+        SecBuffer in_buffers[2] = {};
+        in_buffers[0].BufferType = SECBUFFER_TOKEN;
+        in_buffers[0].pvBuffer = in_buffer.data();
+        in_buffers[0].cbBuffer = static_cast<ULONG>(in_buffer.size());
+        in_buffers[1].BufferType = SECBUFFER_EMPTY;
+
+        SecBufferDesc in_desc = {};
+        in_desc.ulVersion = SECBUFFER_VERSION;
+        in_desc.cBuffers = 2;
+        in_desc.pBuffers = in_buffers;
+
+        out_buffer = {};
+        out_buffer.BufferType = SECBUFFER_TOKEN;
+        out_desc.pBuffers = &out_buffer;
+        out_desc.cBuffers = 1;
+
+        status = InitializeSecurityContextW(
+            &out->cred,
+            &out->ctxt,
+            host.empty() ? nullptr : const_cast<wchar_t*>(host.c_str()),
+            ctx_req,
+            0,
+            0,
+            &in_desc,
+            0,
+            &out->ctxt,
+            &out_desc,
+            &ctx_attr,
+            nullptr);
+
+        if (status == SEC_E_INCOMPLETE_MESSAGE) {
+            continue;
+        }
+
+        if (status == SEC_I_COMPLETE_NEEDED || status == SEC_I_COMPLETE_AND_CONTINUE) {
+            if (CompleteAuthToken(&out->ctxt, &out_desc) != SEC_E_OK) {
+                if (error) {
+                    *error = L"TLS handshake failed";
+                }
+                DeleteSecurityContext(&out->ctxt);
+                FreeCredentialsHandle(&out->cred);
+                return false;
+            }
+        }
+
+        if (out_buffer.cbBuffer && out_buffer.pvBuffer) {
+            bool sent = SendAll(sock, reinterpret_cast<const char*>(out_buffer.pvBuffer), out_buffer.cbBuffer, error);
+            FreeContextBuffer(out_buffer.pvBuffer);
+            out_buffer.pvBuffer = nullptr;
+            if (!sent) {
+                DeleteSecurityContext(&out->ctxt);
+                FreeCredentialsHandle(&out->cred);
+                return false;
+            }
+        }
+
+        if (status == SEC_E_OK) {
+            if (in_buffers[1].BufferType == SECBUFFER_EXTRA && in_buffers[1].cbBuffer > 0) {
+                size_t extra = in_buffers[1].cbBuffer;
+                out->enc_buffer.assign(in_buffer.end() - extra, in_buffer.end());
+            }
+            break;
+        }
+
+        if (status != SEC_I_CONTINUE_NEEDED && status != SEC_I_COMPLETE_AND_CONTINUE) {
+            if (error) {
+                *error = L"TLS handshake failed";
+            }
+            DeleteSecurityContext(&out->ctxt);
+            FreeCredentialsHandle(&out->cred);
+            return false;
+        }
+
+        if (in_buffers[1].BufferType == SECBUFFER_EXTRA && in_buffers[1].cbBuffer > 0) {
+            size_t extra = in_buffers[1].cbBuffer;
+            std::vector<char> leftover(in_buffer.end() - extra, in_buffer.end());
+            in_buffer.swap(leftover);
+        } else {
+            in_buffer.clear();
+        }
+    }
+
+    if (status != SEC_E_OK) {
+        if (error) {
+            *error = L"TLS handshake failed";
+        }
+        DeleteSecurityContext(&out->ctxt);
+        FreeCredentialsHandle(&out->cred);
+        return false;
+    }
+
+    PCCERT_CONTEXT cert = nullptr;
+    if (QueryContextAttributes(&out->ctxt, SECPKG_ATTR_REMOTE_CERT_CONTEXT, &cert) == SEC_E_OK && cert) {
+        bool ok = VerifyServerThumbprint(cert, expected_thumbprint, error);
+        CertFreeCertificateContext(cert);
+        if (!ok) {
+            DeleteSecurityContext(&out->ctxt);
+            FreeCredentialsHandle(&out->cred);
+            return false;
+        }
+    } else if (!expected_thumbprint.empty()) {
+        if (error) {
+            *error = L"Failed to read server certificate";
+        }
+        DeleteSecurityContext(&out->ctxt);
+        FreeCredentialsHandle(&out->cred);
+        return false;
+    }
+
+    if (QueryContextAttributes(&out->ctxt, SECPKG_ATTR_STREAM_SIZES, &out->sizes) != SEC_E_OK) {
+        if (error) {
+            *error = L"TLS stream initialization failed";
+        }
+        DeleteSecurityContext(&out->ctxt);
+        FreeCredentialsHandle(&out->cred);
+        return false;
+    }
+
+    out->sock = sock;
+    out->ready = true;
+    return true;
+}
+
+bool TlsSendAll(TlsConnection* conn, const char* data, size_t size, std::wstring* error) {
+    if (!conn || !conn->ready) {
+        return false;
+    }
+    size_t offset = 0;
+    while (offset < size) {
+        size_t chunk = size - offset;
+        if (chunk > conn->sizes.cbMaximumMessage) {
+            chunk = conn->sizes.cbMaximumMessage;
+        }
+        std::vector<char> buffer(conn->sizes.cbHeader + chunk + conn->sizes.cbTrailer);
+        memcpy(buffer.data() + conn->sizes.cbHeader, data + offset, chunk);
+
+        SecBuffer buffers[4] = {};
+        buffers[0].BufferType = SECBUFFER_STREAM_HEADER;
+        buffers[0].pvBuffer = buffer.data();
+        buffers[0].cbBuffer = conn->sizes.cbHeader;
+        buffers[1].BufferType = SECBUFFER_DATA;
+        buffers[1].pvBuffer = buffer.data() + conn->sizes.cbHeader;
+        buffers[1].cbBuffer = static_cast<ULONG>(chunk);
+        buffers[2].BufferType = SECBUFFER_STREAM_TRAILER;
+        buffers[2].pvBuffer = buffer.data() + conn->sizes.cbHeader + chunk;
+        buffers[2].cbBuffer = conn->sizes.cbTrailer;
+        buffers[3].BufferType = SECBUFFER_EMPTY;
+
+        SecBufferDesc desc = {};
+        desc.ulVersion = SECBUFFER_VERSION;
+        desc.cBuffers = 4;
+        desc.pBuffers = buffers;
+
+        SECURITY_STATUS status = EncryptMessage(&conn->ctxt, 0, &desc, 0);
+        if (status != SEC_E_OK) {
+            if (error) {
+                *error = L"TLS encrypt failed";
+            }
+            return false;
+        }
+
+        size_t to_send = buffers[0].cbBuffer + buffers[1].cbBuffer + buffers[2].cbBuffer;
+        if (!SendAll(conn->sock, buffer.data(), to_send, error)) {
+            return false;
+        }
+        offset += chunk;
+    }
+    return true;
+}
+
+bool TlsFillDecrypted(TlsConnection* conn, std::wstring* error) {
+    if (!conn || !conn->ready) {
+        return false;
+    }
+
+    while (conn->dec_buffer.empty()) {
+        if (conn->enc_buffer.empty()) {
+            if (!RecvSome(conn->sock, &conn->enc_buffer, error)) {
+                return false;
+            }
+        }
+
+        SecBuffer buffers[4] = {};
+        buffers[0].BufferType = SECBUFFER_DATA;
+        buffers[0].pvBuffer = conn->enc_buffer.data();
+        buffers[0].cbBuffer = static_cast<ULONG>(conn->enc_buffer.size());
+        buffers[1].BufferType = SECBUFFER_EMPTY;
+        buffers[2].BufferType = SECBUFFER_EMPTY;
+        buffers[3].BufferType = SECBUFFER_EMPTY;
+
+        SecBufferDesc desc = {};
+        desc.ulVersion = SECBUFFER_VERSION;
+        desc.cBuffers = 4;
+        desc.pBuffers = buffers;
+
+        SECURITY_STATUS status = DecryptMessage(&conn->ctxt, &desc, 0, nullptr);
+        if (status == SEC_E_INCOMPLETE_MESSAGE) {
+            if (!RecvSome(conn->sock, &conn->enc_buffer, error)) {
+                return false;
+            }
+            continue;
+        }
+        if (status == SEC_I_CONTEXT_EXPIRED) {
+            if (error) {
+                *error = L"TLS connection closed";
+            }
+            return false;
+        }
+        if (status == SEC_I_RENEGOTIATE) {
+            if (error) {
+                *error = L"TLS renegotiation not supported";
+            }
+            return false;
+        }
+        if (status != SEC_E_OK) {
+            if (error) {
+                *error = L"TLS decrypt failed";
+            }
+            return false;
+        }
+
+        for (int i = 0; i < 4; ++i) {
+            if (buffers[i].BufferType == SECBUFFER_DATA && buffers[i].cbBuffer > 0) {
+                char* data = reinterpret_cast<char*>(buffers[i].pvBuffer);
+                conn->dec_buffer.insert(conn->dec_buffer.end(), data, data + buffers[i].cbBuffer);
+            }
+        }
+
+        size_t extra = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (buffers[i].BufferType == SECBUFFER_EXTRA && buffers[i].cbBuffer > 0) {
+                extra = buffers[i].cbBuffer;
+                break;
+            }
+        }
+        if (extra > 0) {
+            std::vector<char> leftover(conn->enc_buffer.end() - extra, conn->enc_buffer.end());
+            conn->enc_buffer.swap(leftover);
+        } else {
+            conn->enc_buffer.clear();
+        }
+    }
+
+    conn->dec_offset = 0;
+    return true;
+}
+
+bool TlsRecvAll(TlsConnection* conn, char* data, size_t size, std::wstring* error) {
+    if (!conn || !conn->ready) {
+        return false;
+    }
+    size_t received = 0;
+    while (received < size) {
+        if (conn->dec_buffer.empty() || conn->dec_offset >= conn->dec_buffer.size()) {
+            conn->dec_buffer.clear();
+            conn->dec_offset = 0;
+            if (!TlsFillDecrypted(conn, error)) {
+                return false;
+            }
+        }
+        size_t available = conn->dec_buffer.size() - conn->dec_offset;
+        size_t take = size - received;
+        if (take > available) {
+            take = available;
+        }
+        memcpy(data + received, conn->dec_buffer.data() + conn->dec_offset, take);
+        conn->dec_offset += take;
+        received += take;
+    }
+    return true;
+}
+
+void TlsClose(TlsConnection* conn) {
+    if (!conn || !conn->ready) {
+        return;
+    }
+
+    DWORD shutdown = SCHANNEL_SHUTDOWN;
+    SecBuffer in_buffer = {};
+    in_buffer.BufferType = SECBUFFER_TOKEN;
+    in_buffer.pvBuffer = &shutdown;
+    in_buffer.cbBuffer = sizeof(shutdown);
+
+    SecBufferDesc in_desc = {};
+    in_desc.ulVersion = SECBUFFER_VERSION;
+    in_desc.cBuffers = 1;
+    in_desc.pBuffers = &in_buffer;
+    ApplyControlToken(&conn->ctxt, &in_desc);
+
+    SecBuffer out_buffer = {};
+    out_buffer.BufferType = SECBUFFER_TOKEN;
+    SecBufferDesc out_desc = {};
+    out_desc.ulVersion = SECBUFFER_VERSION;
+    out_desc.cBuffers = 1;
+    out_desc.pBuffers = &out_buffer;
+    DWORD ctx_attr = 0;
+
+    if (InitializeSecurityContextW(&conn->cred, &conn->ctxt, nullptr, 0, 0, 0, nullptr, 0, &conn->ctxt, &out_desc, &ctx_attr, nullptr) == SEC_E_OK) {
+        if (out_buffer.cbBuffer && out_buffer.pvBuffer) {
+            SendAll(conn->sock, reinterpret_cast<const char*>(out_buffer.pvBuffer), out_buffer.cbBuffer, nullptr);
+            FreeContextBuffer(out_buffer.pvBuffer);
+            out_buffer.pvBuffer = nullptr;
+        }
+    }
+
+    DeleteSecurityContext(&conn->ctxt);
+    FreeCredentialsHandle(&conn->cred);
+    conn->ready = false;
+}
+} // namespace
+
+bool ParseTcpUrl(const std::wstring& url, TcpUrlParts* out, std::wstring* error) {
+    if (!out) {
+        return false;
+    }
+    std::wstring input = url;
+    size_t scheme_pos = input.find(L"://");
+    size_t start = 0;
+    bool use_tls = false;
+    if (scheme_pos != std::wstring::npos) {
+        std::wstring scheme = ToLowerString(input.substr(0, scheme_pos));
+        if (scheme == L"tcp") {
+            use_tls = false;
+        } else if (scheme == L"tcps" || scheme == L"tls") {
+            use_tls = true;
+        } else {
+            if (error) {
+                *error = L"Unsupported URL scheme";
+            }
+            return false;
+        }
+        start = scheme_pos + 3;
+    }
+
+    size_t path_pos = input.find(L'/', start);
+    std::wstring hostport = path_pos == std::wstring::npos ? input.substr(start) : input.substr(start, path_pos - start);
+    std::wstring path = path_pos == std::wstring::npos ? L"/" : input.substr(path_pos);
+    if (path.size() > 1 && path[0] == L'/' && path[1] == L'/') {
+        path.erase(path.begin());
+    }
+    if (hostport.empty()) {
+        if (error) {
+            *error = L"Missing host";
+        }
+        return false;
+    }
+
+    std::wstring host;
+    std::wstring port;
+    if (!hostport.empty() && hostport.front() == L'[') {
+        size_t end = hostport.find(L']');
+        if (end == std::wstring::npos) {
+            if (error) {
+                *error = L"Invalid IPv6 host";
+            }
+            return false;
+        }
+        host = hostport.substr(1, end - 1);
+        if (end + 1 < hostport.size() && hostport[end + 1] == L':') {
+            port = hostport.substr(end + 2);
+        }
+    } else {
+        size_t colon = hostport.rfind(L':');
+        if (colon == std::wstring::npos) {
+            if (error) {
+                *error = L"Missing port";
+            }
+            return false;
+        }
+        host = hostport.substr(0, colon);
+        port = hostport.substr(colon + 1);
+    }
+
+    if (host.empty() || port.empty()) {
+        if (error) {
+            *error = L"Invalid host or port";
+        }
+        return false;
+    }
+
+    out->host = host;
+    out->port = port;
+    out->path = path.empty() ? L"/" : path;
+    out->use_tls = use_tls;
+    return true;
+}
+
+#if 0
 bool VerifyServerCertificatePin(HINTERNET request, const std::wstring& expected_thumbprint, std::wstring* error) {
     // Если thumbprint пустой - пропускаем проверку (для тестирования)
     if (expected_thumbprint.empty()) {
@@ -1016,130 +1603,132 @@ bool VerifyServerCertificatePin(HINTERNET request, const std::wstring& expected_
     }
     return true;
 }
+#endif
 
 bool HttpRequest(const std::wstring& method, const std::wstring& url, const std::string& body, std::string* response, std::wstring* error) {
-    UrlParts parts = {};
-    if (!CrackUrl(url, &parts, error)) {
+    TcpUrlParts parts = {};
+    if (!ParseTcpUrl(url, &parts, error)) {
+        return false;
+    }
+    if (!EnsureWinsock(error)) {
         return false;
     }
 
-    HINTERNET session = WinHttpOpen(g_config.user_agent.c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) {
+    addrinfoW hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfoW* results = nullptr;
+    if (GetAddrInfoW(parts.host.c_str(), parts.port.c_str(), &hints, &results) != 0) {
         if (error) {
-            DWORD win_error = GetLastError();
+            DWORD win_error = WSAGetLastError();
             wchar_t buf[256];
-            swprintf_s(buf, L"Failed to open WinHTTP (err: %lu)", win_error);
+            swprintf_s(buf, L"Failed to resolve %s:%s (err: %lu)", parts.host.c_str(), parts.port.c_str(), win_error);
             *error = buf;
         }
         return false;
     }
 
-    HINTERNET connect = WinHttpConnect(session, parts.host.c_str(), parts.port, 0);
-    if (!connect) {
-        DWORD win_error = GetLastError();
-        WinHttpCloseHandle(session);
+    SOCKET sock = INVALID_SOCKET;
+    for (addrinfoW* ptr = results; ptr != nullptr; ptr = ptr->ai_next) {
+        sock = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+        if (sock == INVALID_SOCKET) {
+            continue;
+        }
+        DWORD timeout = kTcpTimeoutMs;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        if (connect(sock, ptr->ai_addr, static_cast<int>(ptr->ai_addrlen)) == SOCKET_ERROR) {
+            closesocket(sock);
+            sock = INVALID_SOCKET;
+            continue;
+        }
+        break;
+    }
+    FreeAddrInfoW(results);
+
+    if (sock == INVALID_SOCKET) {
         if (error) {
-            wchar_t buf[256];
-            swprintf_s(buf, L"Failed to connect to %s:%d (err: %lu)", parts.host.c_str(), parts.port, win_error);
-            *error = buf;
+            *error = L"Failed to connect to server";
         }
         return false;
     }
 
-    DWORD flags = parts.secure ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET request = WinHttpOpenRequest(connect, method.c_str(), parts.path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!request) {
-        DWORD win_error = GetLastError();
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
-        if (error) {
-            wchar_t buf[256];
-            swprintf_s(buf, L"Failed to open request (err: %lu)", win_error);
-            *error = buf;
-        }
-        return false;
-    }
-
-    if (parts.secure) {
-        DWORD secure_flags = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-        WinHttpSetOption(request, WINHTTP_OPTION_SECURE_PROTOCOLS, &secure_flags, sizeof(secure_flags));
-    }
-
-    std::wstring headers;
-    if (!body.empty()) {
-        headers = L"Content-Type: application/json\r\n";
-    }
-
-    BOOL sent = WinHttpSendRequest(request,
-        headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
-        headers.empty() ? 0 : static_cast<DWORD>(headers.size()),
-        body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(body.data()),
-        static_cast<DWORD>(body.size()),
-        static_cast<DWORD>(body.size()),
-        0);
-
-    if (!sent) {
-        DWORD win_error = GetLastError();
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
-        if (error) {
-            wchar_t buf[256];
-            swprintf_s(buf, L"Send failed (err: %lu)", win_error);
-            *error = buf;
-        }
-        return false;
-    }
-
-    if (!WinHttpReceiveResponse(request, nullptr)) {
-        DWORD win_error = GetLastError();
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
-        if (error) {
-            wchar_t buf[256];
-            swprintf_s(buf, L"Receive failed (err: %lu)", win_error);
-            *error = buf;
-        }
-        return false;
-    }
-
-    if (parts.secure) {
-        std::wstring pin_error;
-        if (!VerifyServerCertificatePin(request, g_config.expected_thumbprint, &pin_error)) {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            if (error) {
-                *error = pin_error.empty() ? L"Certificate pin failed" : pin_error;
-            }
+    TlsConnection tls = {};
+    if (parts.use_tls) {
+        if (!TlsHandshake(sock, parts.host, g_config.expected_thumbprint, &tls, error)) {
+            closesocket(sock);
             return false;
         }
     }
 
-    std::string out;
-    DWORD available = 0;
-    do {
-        if (!WinHttpQueryDataAvailable(request, &available)) {
-            break;
-        }
-        if (available == 0) {
-            break;
-        }
-        std::vector<char> buffer(available);
-        DWORD read = 0;
-        if (!WinHttpReadData(request, buffer.data(), available, &read)) {
-            break;
-        }
-        out.append(buffer.data(), read);
-    } while (available > 0);
+    std::string request_line = WideToUtf8(method) + " " + WideToUtf8(parts.path) + "\n";
+    std::string headers = "User-Agent: " + WideToUtf8(g_config.user_agent) + "\n";
+    std::string payload = request_line + headers + "\n" + body;
+    uint32_t payload_size = static_cast<uint32_t>(payload.size());
+    uint32_t payload_size_net = htonl(payload_size);
 
-    WinHttpCloseHandle(request);
-    WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
+    auto send_all = [&](const char* data_ptr, size_t size) -> bool {
+        if (parts.use_tls) {
+            return TlsSendAll(&tls, data_ptr, size, error);
+        }
+        return SendAll(sock, data_ptr, size, error);
+    };
+
+    auto recv_all = [&](char* data_ptr, size_t size) -> bool {
+        if (parts.use_tls) {
+            return TlsRecvAll(&tls, data_ptr, size, error);
+        }
+        return RecvAll(sock, data_ptr, size, error);
+    };
+
+    if (!send_all(reinterpret_cast<const char*>(&payload_size_net), sizeof(payload_size_net)) ||
+        (payload_size > 0 && !send_all(payload.data(), payload.size()))) {
+        if (parts.use_tls) {
+            TlsClose(&tls);
+        }
+        closesocket(sock);
+        return false;
+    }
+
+    uint32_t response_size_net = 0;
+    if (!recv_all(reinterpret_cast<char*>(&response_size_net), sizeof(response_size_net))) {
+        if (parts.use_tls) {
+            TlsClose(&tls);
+        }
+        closesocket(sock);
+        return false;
+    }
+    uint32_t response_size = ntohl(response_size_net);
+    if (response_size > kTcpMaxResponseBytes) {
+        if (parts.use_tls) {
+            TlsClose(&tls);
+        }
+        closesocket(sock);
+        if (error) {
+            *error = L"Response too large";
+        }
+        return false;
+    }
+
+    std::string out;
+    out.resize(response_size);
+    if (response_size > 0 && !recv_all(out.data(), response_size)) {
+        if (parts.use_tls) {
+            TlsClose(&tls);
+        }
+        closesocket(sock);
+        return false;
+    }
+
+    if (parts.use_tls) {
+        TlsClose(&tls);
+    }
+    closesocket(sock);
 
     if (response) {
-        *response = out;
+        *response = std::move(out);
     }
     return true;
 }
@@ -1658,6 +2247,106 @@ bool Base64Decode(const std::string& input, std::vector<BYTE>* out) {
         return false;
     }
     out->resize(size);
+    return true;
+}
+
+bool DecryptAes256Cbc(const std::vector<char>& input,
+                      const std::vector<BYTE>& key,
+                      const std::vector<BYTE>& iv,
+                      std::vector<char>* out,
+                      std::wstring* error) {
+    if (key.size() != 32 || iv.size() != 16) {
+        if (error) {
+            *error = L"Invalid decryption key";
+        }
+        return false;
+    }
+
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_KEY_HANDLE key_handle = nullptr;
+    DWORD obj_size = 0;
+    DWORD obj_size_len = 0;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        if (error) {
+            *error = L"Crypto init failed";
+        }
+        return false;
+    }
+
+    status = BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CBC)),
+                               sizeof(BCRYPT_CHAIN_MODE_CBC), 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        if (error) {
+            *error = L"Crypto init failed";
+        }
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    status = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&obj_size), sizeof(obj_size), &obj_size_len, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        if (error) {
+            *error = L"Crypto init failed";
+        }
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    std::vector<BYTE> key_object(obj_size);
+    status = BCryptGenerateSymmetricKey(alg, &key_handle, key_object.data(), obj_size,
+                                        const_cast<PUCHAR>(key.data()), static_cast<ULONG>(key.size()), 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        if (error) {
+            *error = L"Crypto init failed";
+        }
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    DWORD out_size = 0;
+    status = BCryptDecrypt(key_handle,
+                           reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())),
+                           static_cast<ULONG>(input.size()),
+                           nullptr,
+                           const_cast<PUCHAR>(iv.data()),
+                           static_cast<ULONG>(iv.size()),
+                           nullptr,
+                           0,
+                           &out_size,
+                           BCRYPT_BLOCK_PADDING);
+    if (!BCRYPT_SUCCESS(status)) {
+        if (error) {
+            *error = L"Decrypt failed";
+        }
+        BCryptDestroyKey(key_handle);
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    out->assign(out_size, 0);
+    status = BCryptDecrypt(key_handle,
+                           reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())),
+                           static_cast<ULONG>(input.size()),
+                           nullptr,
+                           const_cast<PUCHAR>(iv.data()),
+                           static_cast<ULONG>(iv.size()),
+                           reinterpret_cast<PUCHAR>(out->data()),
+                           out_size,
+                           &out_size,
+                           BCRYPT_BLOCK_PADDING);
+    if (!BCRYPT_SUCCESS(status)) {
+        if (error) {
+            *error = L"Decrypt failed";
+        }
+        BCryptDestroyKey(key_handle);
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+    out->resize(out_size);
+
+    BCryptDestroyKey(key_handle);
+    BCryptCloseAlgorithmProvider(alg, 0);
     return true;
 }
 
@@ -2999,6 +3688,9 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     // Парсим ответ - получаем уникальный URL для скачивания
     std::string dll_url_utf8;
     std::string dll_sha256;
+    std::string dll_key_b64;
+    std::string dll_iv_b64;
+    std::string dll_alg;
     bool ok = false;
     
     // Сначала пытаемся получить ok
@@ -3036,6 +3728,14 @@ DWORD WINAPI WorkerThread(LPVOID param) {
         log_event("request_dll_fail", "missing_url_or_hash");
         return fail_dashboard(L"An unknown error occured: D1000017/D1000017"); // Missing DLL URL or hash
     }
+
+    JsonGetStringTopLevel(response, "dll_key", &dll_key_b64);
+    JsonGetStringTopLevel(response, "dll_iv", &dll_iv_b64);
+    JsonGetStringTopLevel(response, "dll_alg", &dll_alg);
+    bool has_encryption = !dll_key_b64.empty() || !dll_iv_b64.empty() || !dll_alg.empty();
+    if (has_encryption && dll_alg.empty()) {
+        dll_alg = "aes-256-cbc";
+    }
     
     // Скачиваем уникальную DLL
     std::wstring download_status = L"Downloading " + (program.name.empty() ? std::wstring(L"build") : program.name) + L"...";
@@ -3046,6 +3746,36 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     if (!HttpGetBinary(dll_url_wide, &dll_bytes, &error)) {
         log_event("download_fail", WideToUtf8(error));
         return fail_dashboard(L"An unknown error occured: D1000008/D1000008"); // Failed to download DLL
+    }
+
+    if (has_encryption) {
+        if (dll_key_b64.empty() || dll_iv_b64.empty()) {
+            log_event("download_fail", "missing_payload_key");
+            return fail_dashboard(L"An unknown error occured: D1000029/D1000029"); // Missing payload key
+        }
+        if (!dll_alg.empty() && dll_alg != "aes-256-cbc") {
+            log_event("download_fail", "unsupported_payload_alg");
+            return fail_dashboard(L"An unknown error occured: D1000030/D1000030"); // Unsupported payload cipher
+        }
+        std::vector<BYTE> key_bytes;
+        std::vector<BYTE> iv_bytes;
+        if (!Base64Decode(dll_key_b64, &key_bytes) || !Base64Decode(dll_iv_b64, &iv_bytes)) {
+            log_event("download_fail", "invalid_payload_key");
+            return fail_dashboard(L"An unknown error occured: D1000031/D1000031"); // Invalid payload key
+        }
+        std::vector<char> decrypted;
+        std::wstring decrypt_error;
+        if (!DecryptAes256Cbc(dll_bytes, key_bytes, iv_bytes, &decrypted, &decrypt_error)) {
+            log_event("download_fail", "decrypt_failed");
+            return fail_dashboard(L"An unknown error occured: D1000032/D1000032"); // Payload decrypt failed
+        }
+        if (!key_bytes.empty()) {
+            SecureZeroMemory(key_bytes.data(), key_bytes.size());
+        }
+        if (!iv_bytes.empty()) {
+            SecureZeroMemory(iv_bytes.data(), iv_bytes.size());
+        }
+        dll_bytes.swap(decrypted);
     }
 
     SetStatus(hwnd, L"Verifying build...");
@@ -3066,8 +3796,9 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     // Подготавливаем конфигурацию для DLL через shared memory
     shared_config::SharedConfig sharedCfg = {};
     sharedCfg.magic = SHARED_CONFIG_MAGIC;
-    sharedCfg.version = 1;
+    sharedCfg.version = 2;
     wcscpy_s(sharedCfg.server_url, g_config.server_url.c_str());
+    wcscpy_s(sharedCfg.server_thumbprint, g_config.expected_thumbprint.c_str());
     wcscpy_s(sharedCfg.license_key, g_cached_key.c_str());
     
     // HWID в wide string

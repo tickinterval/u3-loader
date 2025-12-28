@@ -14,6 +14,7 @@ namespace shared_config {
 
 // Максимальные размеры строк
 #define MAX_URL_LENGTH 256
+#define MAX_THUMBPRINT_LENGTH 128
 #define MAX_KEY_LENGTH 64
 #define MAX_HWID_LENGTH 128
 #define MAX_PRODUCT_LENGTH 32
@@ -24,7 +25,8 @@ namespace shared_config {
 struct SharedConfig {
     DWORD magic;                            // Магическое число для проверки
     DWORD version;                          // Версия структуры
-    wchar_t server_url[MAX_URL_LENGTH];     // URL сервера
+    wchar_t server_url[MAX_URL_LENGTH];     // TCP server URL (tcps://host:port)
+    wchar_t server_thumbprint[MAX_THUMBPRINT_LENGTH]; // TLS certificate pin (hex)
     wchar_t license_key[MAX_KEY_LENGTH];    // Лицензионный ключ
     wchar_t hwid[MAX_HWID_LENGTH];          // Hardware ID
     wchar_t product_code[MAX_PRODUCT_LENGTH]; // Код продукта
@@ -143,4 +145,3 @@ inline void CleanupConfig(HANDLE mapping) {
 
 } // namespace shared_config
 } // namespace loader
-

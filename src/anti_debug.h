@@ -6,6 +6,8 @@
 namespace loader {
 namespace anti_debug {
 
+using NTSTATUS = LONG;
+
 // ================== BASIC CHECKS ==================
 
 // Проверка IsDebuggerPresent
