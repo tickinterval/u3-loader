@@ -2,23 +2,23 @@
 
 namespace loader {
 
-const COLORREF kBgTop = RGB(8, 11, 18);
-const COLORREF kBgBottom = RGB(16, 20, 30);
-const COLORREF kTitleTop = RGB(12, 15, 22);
-const COLORREF kTitleBottom = RGB(18, 22, 32);
-const COLORREF kFrameBorder = RGB(30, 38, 52);
-const COLORREF kSurface = RGB(22, 28, 40);
-const COLORREF kSurfaceAlt = RGB(28, 36, 50);
-const COLORREF kSurfaceBorder = RGB(46, 60, 82);
-const COLORREF kButtonHover = RGB(34, 44, 60);
-const COLORREF kButtonPressed = RGB(26, 34, 48);
-const COLORREF kRowEven = RGB(22, 28, 40);
-const COLORREF kRowOdd = RGB(26, 33, 46);
-const COLORREF kRowSelected = RGB(38, 64, 86);
-const COLORREF kTextColor = RGB(232, 236, 243);
-const COLORREF kAccentColor = RGB(92, 234, 214);
-const COLORREF kAccentAlt = RGB(90, 160, 255);
-const COLORREF kMutedColor = RGB(148, 158, 172);
+const COLORREF kBgTop = RGB(14, 15, 18);
+const COLORREF kBgBottom = RGB(24, 26, 31);
+const COLORREF kTitleTop = RGB(18, 20, 24);
+const COLORREF kTitleBottom = RGB(30, 33, 40);
+const COLORREF kFrameBorder = RGB(52, 58, 70);
+const COLORREF kSurface = RGB(24, 28, 34);
+const COLORREF kSurfaceAlt = RGB(30, 34, 41);
+const COLORREF kSurfaceBorder = RGB(70, 78, 92);
+const COLORREF kButtonHover = RGB(42, 48, 58);
+const COLORREF kButtonPressed = RGB(34, 40, 50);
+const COLORREF kRowEven = RGB(24, 28, 34);
+const COLORREF kRowOdd = RGB(28, 32, 38);
+const COLORREF kRowSelected = RGB(30, 44, 62);
+const COLORREF kTextColor = RGB(232, 237, 244);
+const COLORREF kAccentColor = RGB(92, 220, 186);
+const COLORREF kAccentAlt = RGB(120, 190, 255);
+const COLORREF kMutedColor = RGB(144, 154, 170);
 const COLORREF kMaskColor = RGB(255, 0, 255);
 
 const char kLoaderVersion[] = "1.2.2";

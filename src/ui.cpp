@@ -272,15 +272,15 @@ void DestroyFonts() {
 
 void CreateFonts() {
     DestroyFonts();
-    g_title_font = CreateFontW(-Scale(30), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    g_title_font = CreateFontW(-Scale(28), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Bahnschrift");
-    g_subtitle_font = CreateFontW(-Scale(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    g_subtitle_font = CreateFontW(-Scale(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                   OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Bahnschrift");
-    g_body_font = CreateFontW(-Scale(15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    g_body_font = CreateFontW(-Scale(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                               OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Bahnschrift");
-    g_small_font = CreateFontW(-Scale(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    g_small_font = CreateFontW(-Scale(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Bahnschrift");
-    g_avatar_font = CreateFontW(-Scale(12), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    g_avatar_font = CreateFontW(-Scale(11), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                 OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Bahnschrift");
 }
 
@@ -2852,6 +2852,27 @@ int RandomDelayMs(int min_ms, int max_ms) {
     return min_ms + (rand() % range);
 }
 
+void FillHorizontalGradient(HDC dc, const RECT& rc, COLORREF left, COLORREF right) {
+    if (rc.right <= rc.left || rc.bottom <= rc.top) {
+        return;
+    }
+    TRIVERTEX verts[2] = {};
+    verts[0].x = rc.left;
+    verts[0].y = rc.top;
+    verts[0].Red = static_cast<COLOR16>(GetRValue(left) << 8);
+    verts[0].Green = static_cast<COLOR16>(GetGValue(left) << 8);
+    verts[0].Blue = static_cast<COLOR16>(GetBValue(left) << 8);
+    verts[0].Alpha = 0xFFFF;
+    verts[1].x = rc.right;
+    verts[1].y = rc.bottom;
+    verts[1].Red = static_cast<COLOR16>(GetRValue(right) << 8);
+    verts[1].Green = static_cast<COLOR16>(GetGValue(right) << 8);
+    verts[1].Blue = static_cast<COLOR16>(GetBValue(right) << 8);
+    verts[1].Alpha = 0xFFFF;
+    GRADIENT_RECT gradient = {0, 1};
+    GradientFill(dc, verts, 2, &gradient, 1, GRADIENT_FILL_RECT_H);
+}
+
 void DrawBackground(HDC dc, const RECT& rc) {
     TRIVERTEX verts[2] = {};
     verts[0].x = rc.left;
@@ -2869,13 +2890,13 @@ void DrawBackground(HDC dc, const RECT& rc) {
     GRADIENT_RECT gradient = {0, 1};
     GradientFill(dc, verts, 2, &gradient, 1, GRADIENT_FILL_RECT_V);
 
-    HPEN grid = CreatePen(PS_SOLID, 1, RGB(18, 24, 34));
+    HPEN grid = CreatePen(PS_SOLID, 1, RGB(20, 22, 28));
     HPEN old_pen = reinterpret_cast<HPEN>(SelectObject(dc, grid));
-    int step = Scale(96);
-    int offset = Scale(48);
-    for (int x = rc.left + offset; x < rc.right; x += step) {
-        MoveToEx(dc, x, rc.top, nullptr);
-        LineTo(dc, x, rc.bottom);
+    int step = Scale(88);
+    int height = rc.bottom - rc.top;
+    for (int x = rc.left - height; x < rc.right; x += step) {
+        MoveToEx(dc, x, rc.bottom, nullptr);
+        LineTo(dc, x + height, rc.top);
     }
     SelectObject(dc, old_pen);
     DeleteObject(grid);
@@ -2885,11 +2906,11 @@ void DrawPanel(HDC dc, const RECT& rc) {
     if (rc.right <= rc.left || rc.bottom <= rc.top) {
         return;
     }
-    int radius = Scale(12);
+    int radius = Scale(10);
     RECT shadow = rc;
-    OffsetRect(&shadow, Scale(3), Scale(5));
+    OffsetRect(&shadow, Scale(2), Scale(4));
     HRGN shadow_rgn = CreateRoundRectRgn(shadow.left, shadow.top, shadow.right + 1, shadow.bottom + 1, radius, radius);
-    HBRUSH shadow_brush = CreateSolidBrush(RGB(6, 8, 12));
+    HBRUSH shadow_brush = CreateSolidBrush(RGB(8, 10, 14));
     FillRgn(dc, shadow_rgn, shadow_brush);
     DeleteObject(shadow_brush);
     DeleteObject(shadow_rgn);
@@ -2917,12 +2938,19 @@ void DrawPanel(HDC dc, const RECT& rc) {
     FrameRgn(dc, rgn, border, 1, 1);
     DeleteObject(border);
 
-    int accent_width = min(Scale(140), rc.right - rc.left - Scale(32));
-    if (accent_width > 0) {
-        RECT accent = {rc.left + Scale(16), rc.top + Scale(2), rc.left + Scale(16) + accent_width, rc.top + Scale(4)};
-        HBRUSH accent_brush = CreateSolidBrush(kAccentAlt);
-        FillRect(dc, &accent, accent_brush);
-        DeleteObject(accent_brush);
+    RECT inner = rc;
+    InflateRect(&inner, -1, -1);
+    int inner_radius = max(0, radius - Scale(2));
+    HRGN inner_rgn = CreateRoundRectRgn(inner.left, inner.top, inner.right + 1, inner.bottom + 1, inner_radius, inner_radius);
+    HBRUSH inner_brush = CreateSolidBrush(RGB(16, 18, 22));
+    FrameRgn(dc, inner_rgn, inner_brush, 1, 1);
+    DeleteObject(inner_brush);
+    DeleteObject(inner_rgn);
+
+    int accent_inset = Scale(14);
+    RECT accent = {rc.left + accent_inset, rc.top + Scale(3), rc.right - accent_inset, rc.top + Scale(5)};
+    if (accent.right > accent.left && accent.bottom > accent.top) {
+        FillHorizontalGradient(dc, accent, kAccentAlt, kAccentColor);
     }
     DeleteObject(rgn);
 }
@@ -2931,7 +2959,7 @@ void DrawTableHeader(HDC dc, const RECT& rc) {
     if (rc.right <= rc.left || rc.bottom <= rc.top) {
         return;
     }
-    HBRUSH fill = CreateSolidBrush(kSurfaceAlt);
+    HBRUSH fill = CreateSolidBrush(kSurface);
     FillRect(dc, &rc, fill);
     DeleteObject(fill);
 
@@ -2941,42 +2969,47 @@ void DrawTableHeader(HDC dc, const RECT& rc) {
     LineTo(dc, rc.right, rc.bottom - 1);
     SelectObject(dc, old_pen);
     DeleteObject(line);
+
+    RECT accent = {rc.left + Scale(12), rc.top + Scale(2), rc.right - Scale(12), rc.top + Scale(3)};
+    FillHorizontalGradient(dc, accent, kAccentAlt, kAccentColor);
 }
 
-void DrawProgramCard(HDC dc, const RECT& item, const ProgramInfo& program, bool selected) {
+void DrawProgramCard(HDC dc, const RECT& item, const ProgramInfo& program, bool selected, int index) {
     RECT card = item;
-    int pad_x = Scale(8);
-    int pad_y = Scale(4);
+    int pad_x = Scale(10);
+    int pad_y = Scale(6);
     card.left += pad_x;
     card.right -= pad_x;
     card.top += pad_y / 2;
     card.bottom -= pad_y / 2;
 
+    COLORREF fill = selected ? kRowSelected : ((index % 2 == 0) ? kRowEven : kRowOdd);
     COLORREF border = selected ? kAccentAlt : kSurfaceBorder;
-    COLORREF fill = selected ? RGB(26, 36, 50) : kSurfaceAlt;
 
+    int radius = Scale(8);
+    HRGN card_rgn = CreateRoundRectRgn(card.left, card.top, card.right + 1, card.bottom + 1, radius, radius);
     HBRUSH fill_brush = CreateSolidBrush(fill);
-    FillRect(dc, &card, fill_brush);
+    FillRgn(dc, card_rgn, fill_brush);
     DeleteObject(fill_brush);
     HBRUSH border_brush = CreateSolidBrush(border);
-    FrameRect(dc, &card, border_brush);
+    FrameRgn(dc, card_rgn, border_brush, 1, 1);
     DeleteObject(border_brush);
 
-    RECT top_line = {card.left + Scale(10), card.top + Scale(2), card.right - Scale(10), card.top + Scale(4)};
-    HBRUSH top_brush = CreateSolidBrush(selected ? kAccentColor : kSurfaceBorder);
-    FillRect(dc, &top_line, top_brush);
-    DeleteObject(top_brush);
+    COLORREF accent_left = selected ? kAccentAlt : kSurfaceBorder;
+    COLORREF accent_right = selected ? kAccentColor : kSurfaceBorder;
+    RECT top_line = {card.left + Scale(10), card.top + Scale(2), card.right - Scale(10), card.top + Scale(3)};
+    FillHorizontalGradient(dc, top_line, accent_left, accent_right);
 
     COLORREF status_color = GetStatusColor(program.status);
-    RECT bar = {card.left + Scale(4), card.top + Scale(6), card.left + Scale(8), card.bottom - Scale(6)};
+    RECT bar = {card.left + Scale(4), card.top + Scale(6), card.left + Scale(7), card.bottom - Scale(6)};
     HBRUSH bar_brush = CreateSolidBrush(status_color);
     FillRect(dc, &bar, bar_brush);
     DeleteObject(bar_brush);
 
     int card_height = card.bottom - card.top;
-    int avatar_size = min(Scale(44), card_height - Scale(10));
-    if (avatar_size < Scale(28)) {
-        avatar_size = max(Scale(20), card_height - Scale(6));
+    int avatar_size = min(Scale(48), card_height - Scale(12));
+    if (avatar_size < Scale(30)) {
+        avatar_size = max(Scale(22), card_height - Scale(8));
     }
     int avatar_x = card.left + Scale(14);
     int avatar_y = card.top + (card_height - avatar_size) / 2;
@@ -3009,7 +3042,7 @@ void DrawProgramCard(HDC dc, const RECT& item, const ProgramInfo& program, bool 
         SelectObject(dc, old_font);
     }
 
-    int text_top = card.top + Scale(10);
+    int text_top = card.top + Scale(8);
     int subtitle_top = text_top + title_height + Scale(4);
     int text_bottom_limit = card.bottom - Scale(8);
     if (subtitle_top + subtitle_height > text_bottom_limit) {
@@ -3033,6 +3066,7 @@ void DrawProgramCard(HDC dc, const RECT& item, const ProgramInfo& program, bool 
     SetTextColor(dc, kMutedColor);
     DrawTextW(dc, subtitle.c_str(), -1, &sub, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
     SelectObject(dc, old_font);
+    DeleteObject(card_rgn);
 }
 
 void DrawTitleBar(HDC dc, int width) {
@@ -3064,15 +3098,8 @@ void DrawTitleBar(HDC dc, int width) {
     SelectObject(dc, old_pen);
     DeleteObject(border);
 
-    int accent_width = min(Scale(120), width - Scale(40));
-    if (accent_width > 0) {
-        HPEN accent = CreatePen(PS_SOLID, 1, kAccentAlt);
-        old_pen = reinterpret_cast<HPEN>(SelectObject(dc, accent));
-        MoveToEx(dc, rc.left + Scale(20), rc.bottom - 2, nullptr);
-        LineTo(dc, rc.left + Scale(20) + accent_width, rc.bottom - 2);
-        SelectObject(dc, old_pen);
-        DeleteObject(accent);
-    }
+    RECT accent = {rc.left + Scale(18), rc.bottom - Scale(3), rc.right - Scale(18), rc.bottom - Scale(2)};
+    FillHorizontalGradient(dc, accent, kAccentAlt, kAccentColor);
 }
 
 void DrawTitleButton(HDC dc, const RECT& rc, bool hover, bool pressed, bool is_close) {
@@ -3082,17 +3109,18 @@ void DrawTitleButton(HDC dc, const RECT& rc, bool hover, bool pressed, bool is_c
         DeleteObject(brush);
     }
 
-    COLORREF glyph = hover && is_close ? RGB(255, 120, 120) : kTextColor;
-    HPEN pen = CreatePen(PS_SOLID, Scale(2), glyph);
+    COLORREF glyph = hover && is_close ? RGB(255, 110, 110) : kTextColor;
+    int stroke = max(1, Scale(1));
+    HPEN pen = CreatePen(PS_SOLID, stroke, glyph);
     HPEN old_pen = reinterpret_cast<HPEN>(SelectObject(dc, pen));
-    int pad = Scale(8);
+    int pad = Scale(9);
     if (is_close) {
         MoveToEx(dc, rc.left + pad, rc.top + pad, nullptr);
         LineTo(dc, rc.right - pad, rc.bottom - pad);
         MoveToEx(dc, rc.right - pad, rc.top + pad, nullptr);
         LineTo(dc, rc.left + pad, rc.bottom - pad);
     } else {
-        int y = (rc.top + rc.bottom) / 2 + Scale(4);
+        int y = (rc.top + rc.bottom) / 2;
         MoveToEx(dc, rc.left + pad, y, nullptr);
         LineTo(dc, rc.right - pad, y);
     }
@@ -3101,7 +3129,7 @@ void DrawTitleButton(HDC dc, const RECT& rc, bool hover, bool pressed, bool is_c
 }
 
 void DrawButtonSurface(HDC dc, const RECT& rc, COLORREF top, COLORREF bottom, COLORREF border) {
-    int radius = Scale(14);
+    int radius = Scale(10);
     HRGN rgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1, radius, radius);
     SelectClipRgn(dc, rgn);
 
@@ -3125,6 +3153,14 @@ void DrawButtonSurface(HDC dc, const RECT& rc, COLORREF top, COLORREF bottom, CO
     HBRUSH border_brush = CreateSolidBrush(border);
     FrameRgn(dc, rgn, border_brush, 1, 1);
     DeleteObject(border_brush);
+    RECT inner = rc;
+    InflateRect(&inner, -1, -1);
+    int inner_radius = max(0, radius - Scale(2));
+    HRGN inner_rgn = CreateRoundRectRgn(inner.left, inner.top, inner.right + 1, inner.bottom + 1, inner_radius, inner_radius);
+    HBRUSH inner_brush = CreateSolidBrush(RGB(16, 18, 22));
+    FrameRgn(dc, inner_rgn, inner_brush, 1, 1);
+    DeleteObject(inner_brush);
+    DeleteObject(inner_rgn);
     DeleteObject(rgn);
 }
 
@@ -3235,7 +3271,7 @@ void InitAvatarList() {
     }
     g_avatar_bitmaps.clear();
     g_avatar_index.clear();
-    int size = Scale(52);
+    int size = Scale(56);
     g_avatar_list = ImageList_Create(size, size, ILC_COLOR32 | ILC_MASK, 4, 1);
     if (!g_avatar_list) {
         return;
@@ -3283,7 +3319,7 @@ void EnsureAvatarForProgram(const ProgramInfo& program) {
     if (g_avatar_index.find(program.code) != g_avatar_index.end()) {
         return;
     }
-    int size = Scale(52);
+    int size = Scale(56);
     HBITMAP bmp = LoadAvatarBitmap(program.avatar_path, size);
     if (!bmp) {
         return;
@@ -3872,15 +3908,15 @@ void LayoutControls(HWND hwnd) {
     RECT rc = {};
     GetClientRect(hwnd, &rc);
 
-    int padding = Scale(32);
+    int padding = Scale(28);
     int width = rc.right - rc.left;
     int height = rc.bottom - rc.top;
 
     int x = padding;
-    g_titlebar_height = Scale(52);
-    int y = g_titlebar_height + Scale(16);
+    g_titlebar_height = Scale(46);
+    int y = g_titlebar_height + Scale(12);
     int field_width = width - padding * 2;
-    int button_width = Scale(200);
+    int button_width = Scale(180);
 
     if (!g_edit) {
         return;
@@ -3895,7 +3931,7 @@ void LayoutControls(HWND hwnd) {
     int button_height = body_height + Scale(12);
     int status_height = label_height;
     int column_height = label_height;
-    int card_padding = Scale(20);
+    int card_padding = Scale(18);
 
     int title_y = (g_titlebar_height - title_height) / 2;
     MoveWindow(g_title, x, title_y, field_width, title_height, TRUE);
@@ -3910,42 +3946,43 @@ void LayoutControls(HWND hwnd) {
     y += subtitle_height + Scale(20);
 
     if (g_stage == UiStage::Login) {
-        int card_width = min(field_width, Scale(860));
+        int card_width = min(field_width, Scale(900));
         int card_left = (width - card_width) / 2;
-        int panel_gap = Scale(18);
-        int panel_width = (card_width - panel_gap) / 2;
+        int panel_gap = Scale(20);
+        int left_width = static_cast<int>(card_width * 0.42f);
+        int right_width = card_width - panel_gap - left_width;
 
         int left_left = card_left;
         int left_top = y;
         int left_y = left_top + card_padding;
-        int left_field_width = panel_width - card_padding * 2;
+        int left_field_width = left_width - card_padding * 2;
         MoveWindow(g_label_key, left_left + card_padding, left_y, left_field_width, label_height, TRUE);
-        left_y += label_height + Scale(8);
+        left_y += label_height + Scale(10);
 
         MoveWindow(g_edit, left_left + card_padding, left_y, left_field_width, edit_height, TRUE);
-        left_y += edit_height + Scale(14);
+        left_y += edit_height + Scale(12);
 
         MoveWindow(g_button, left_left + card_padding, left_y, left_field_width, button_height, TRUE);
-        SetRoundedRegion(g_button, Scale(14));
-        left_y += button_height + Scale(10);
-        g_card_auth = {left_left, left_top, left_left + panel_width, left_y + card_padding};
+        SetRoundedRegion(g_button, Scale(10));
+        left_y += button_height + Scale(12);
+        g_card_auth = {left_left, left_top, left_left + left_width, left_y + card_padding};
 
-        int right_left = left_left + panel_width + panel_gap;
+        int right_left = left_left + left_width + panel_gap;
         int right_top = left_top;
         int right_y = right_top + card_padding;
-        int right_field_width = panel_width - card_padding * 2;
+        int right_field_width = right_width - card_padding * 2;
         MoveWindow(g_label_programs, right_left + card_padding, right_y, right_field_width, header_height, TRUE);
         right_y += header_height + Scale(8);
         MoveWindow(g_status, right_left + card_padding, right_y, right_field_width, status_height, TRUE);
-        right_y += status_height + Scale(10);
-        g_card_programs = {right_left, right_top, right_left + panel_width, right_y + card_padding};
+        right_y += status_height + Scale(12);
+        g_card_programs = {right_left, right_top, right_left + right_width, right_y + card_padding};
         g_table_header = {};
     } else if (g_stage == UiStage::Connecting || g_stage == UiStage::Loading) {
-        int card_width = min(field_width, Scale(520));
-        int card_height = Scale(180);
+        int card_width = min(field_width, Scale(540));
+        int card_height = Scale(190);
         int card_left = (width - card_width) / 2;
         int card_top = (height - card_height) / 2;
-        int card_padding = Scale(20);
+        int card_padding = Scale(18);
         g_card_auth = {card_left, card_top, card_left + card_width, card_top + card_height};
         g_card_programs = {};
         g_table_header = {};
@@ -3955,23 +3992,23 @@ void LayoutControls(HWND hwnd) {
         header_y += header_height + Scale(10);
         MoveWindow(g_status, card_left + card_padding, header_y, card_width - card_padding * 2, status_height, TRUE);
     } else {
-        int panel_width = min(field_width, Scale(860));
+        int panel_width = min(field_width, Scale(900));
         int panel_left = (width - panel_width) / 2;
-        int panel_padding = Scale(18);
+        int panel_padding = Scale(16);
 
         int toolbar_top = y;
         int header_y = toolbar_top + panel_padding;
         MoveWindow(g_label_programs, panel_left + panel_padding, header_y,
                    panel_width - panel_padding * 2 - button_width - Scale(12), header_height, TRUE);
         MoveWindow(g_button, panel_left + panel_width - panel_padding - button_width, header_y - Scale(4), button_width, button_height, TRUE);
-        SetRoundedRegion(g_button, Scale(14));
+        SetRoundedRegion(g_button, Scale(10));
         header_y += header_height + Scale(8);
         MoveWindow(g_status, panel_left + panel_padding, header_y, panel_width - panel_padding * 2, status_height, TRUE);
         int toolbar_bottom = header_y + status_height + panel_padding;
         g_card_auth = {panel_left, toolbar_top, panel_left + panel_width, toolbar_bottom};
 
-        int list_top = toolbar_bottom + Scale(18);
-        int list_padding = Scale(18);
+        int list_top = toolbar_bottom + Scale(16);
+        int list_padding = Scale(14);
         int list_width = panel_width - list_padding * 2;
         int list_y = list_top + list_padding;
         int list_height = height - list_y - padding;
@@ -4327,7 +4364,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                         }
                         LeaveCriticalSection(&g_programs_lock);
                         bool selected = (index == g_selected_index);
-                        DrawProgramCard(draw->nmcd.hdc, item, info, selected);
+                        DrawProgramCard(draw->nmcd.hdc, item, info, selected, index);
                     }
                     return CDRF_SKIPDEFAULT;
                 }
@@ -4355,9 +4392,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 if (g_panel_brush) {
                     FillRect(dc, &rect, g_panel_brush);
                 }
-                COLORREF top = enabled ? (pressed ? kAccentAlt : kAccentColor) : kSurfaceBorder;
-                COLORREF bottom = enabled ? (pressed ? kAccentColor : kAccentAlt) : kSurfaceBorder;
-                COLORREF border = enabled ? kAccentAlt : kSurfaceBorder;
+                COLORREF top = enabled ? (pressed ? RGB(30, 36, 44) : RGB(36, 42, 52)) : kSurfaceBorder;
+                COLORREF bottom = enabled ? (pressed ? RGB(26, 30, 38) : RGB(30, 34, 42)) : kSurfaceBorder;
+                COLORREF border = enabled ? (pressed ? kAccentColor : kAccentAlt) : kSurfaceBorder;
                 DrawButtonSurface(dc, rect, top, bottom, border);
 
                 SetBkMode(dc, TRANSPARENT);
@@ -4413,10 +4450,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
             bool is_panel_label = (control == g_label_key || control == g_status || control == g_label_programs);
             if (is_panel_label) {
-                SetBkMode(dc, OPAQUE);
-                SetBkColor(dc, kSurface);
+                SetBkMode(dc, TRANSPARENT);
                 SetTextColor(dc, (control == g_status || control == g_label_programs) ? kTextColor : kMutedColor);
-                return reinterpret_cast<LRESULT>(g_panel_brush);
+                return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
             }
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, kMutedColor);
@@ -4425,8 +4461,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         case WM_CTLCOLOREDIT: {
             HDC dc = reinterpret_cast<HDC>(wparam);
             SetTextColor(dc, kTextColor);
-            SetBkColor(dc, kSurface);
-            return reinterpret_cast<LRESULT>(g_panel_brush);
+            SetBkColor(dc, kSurfaceAlt);
+            return reinterpret_cast<LRESULT>(g_panel_alt_brush);
         }
         case WM_ERASEBKGND: {
             return 1;
