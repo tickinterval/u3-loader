@@ -80,6 +80,11 @@ constexpr int kControlIdButton = 1002;
 constexpr int kControlIdStatus = 1003;
 constexpr int kControlIdList = 1004;
 
+constexpr int kDxUiCardPadding = 14;
+constexpr int kDxUiHeaderHeight = 16;
+constexpr int kDxUiListItemHeight = 64;
+constexpr int kDxUiListItemGap = 10;
+
 constexpr UINT kMsgUpdateStatus = WM_APP + 1;
 constexpr UINT kMsgProgramsUpdated = WM_APP + 2;
 constexpr UINT kMsgAutoValidate = WM_APP + 3;
@@ -116,7 +121,15 @@ extern bool g_validated;
 extern UINT g_dpi;
 extern RECT g_card_auth;
 extern RECT g_card_programs;
+extern RECT g_card_telemetry;
 extern RECT g_table_header;
+extern RECT g_field_key;
+extern int g_products_scroll;
+extern int g_hover_product_index;
+extern POINT g_mouse_pos;
+extern bool g_mouse_in_window;
+extern std::string g_last_error_code;
+extern bool g_keyboard_nav_active;
 extern RECT g_btn_close;
 extern RECT g_btn_min;
 extern int g_titlebar_height;

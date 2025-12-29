@@ -6,6 +6,7 @@
 #include "shared_config.h"
 #include "hwid_validator.h"
 #include "process_info.h"
+#include "ui_dx.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <bcrypt.h>
@@ -28,6 +29,8 @@
 #include <cstdlib>
 #include <unordered_map>
 #include <mutex>
+#include <memory>
+#include <cwctype>
 
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wintrust.lib")
@@ -36,6 +39,10 @@
 
 namespace loader {
 std::wstring ToLowerString(const std::wstring& value);
+std::wstring NormalizeKeyWide(const std::wstring& input);
+std::wstring FormatKeyDisplay(const std::wstring& input);
+int CountKeyChars(const std::wstring& input, size_t up_to);
+int MapKeyIndexToFormatted(int key_index, int total_key_chars);
 COLORREF GetStatusColor(const std::wstring& status);
 int GetAvatarIndex(const std::wstring& code);
 std::string EscapeSigField(const std::string& value);
@@ -54,6 +61,8 @@ static std::vector<HBITMAP> g_avatar_bitmaps;
 static bool g_gdiplus_started = false;
 static ULONG_PTR g_gdiplus_token = 0;
 static bool g_ignore_key_change = false;
+static std::unique_ptr<DxUiRenderer> g_dx_ui;
+static constexpr bool kEnableDxUi = true;
 
 constexpr UINT kUiTimerId = 1;
 constexpr BYTE kFadeStep = 18;
@@ -61,6 +70,47 @@ static bool g_fade_active = false;
 static BYTE g_fade_alpha = 0;
 static std::wstring g_status_base;
 static int g_status_anim_tick = 0;
+static bool g_button_hover = false;
+static POINT g_button_hover_pt = {};
+static bool g_button_layered = false;
+static bool g_dx_button_pressed = false;
+
+void ConfigureDxButtonWindow(HWND hwnd) {
+    if (!hwnd) {
+        return;
+    }
+    LONG_PTR ex_style = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    if ((ex_style & WS_EX_LAYERED) != 0) {
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex_style & ~WS_EX_LAYERED);
+    }
+    g_button_layered = false;
+}
+
+void SetDxButtonAlpha(HWND hwnd, BYTE alpha) {
+    if (!hwnd) {
+        return;
+    }
+    if (!g_button_layered) {
+        ConfigureDxButtonWindow(hwnd);
+    }
+    if (g_button_layered) {
+        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+    }
+}
+
+static LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
+                                           UINT_PTR, DWORD_PTR) {
+    switch (msg) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(hwnd, ButtonSubclassProc, 0);
+            break;
+        default:
+            break;
+    }
+    return DefSubclassProc(hwnd, msg, wparam, lparam);
+}
 
 struct WindowState {
     bool is_status = false;
@@ -2769,6 +2819,7 @@ bool LoadSavedKey(std::wstring* key) {
     }
     std::wstring value(reinterpret_cast<wchar_t*>(out_blob.pbData));
     LocalFree(out_blob.pbData);
+    value = FormatKeyDisplay(value);
     if (value.empty()) {
         return false;
     }
@@ -3128,8 +3179,10 @@ void DrawTitleButton(HDC dc, const RECT& rc, bool hover, bool pressed, bool is_c
     DeleteObject(pen);
 }
 
+int GetButtonCornerRadius(const RECT& rc, bool use_dx);
+
 void DrawButtonSurface(HDC dc, const RECT& rc, COLORREF top, COLORREF bottom, COLORREF border) {
-    int radius = Scale(10);
+    int radius = GetButtonCornerRadius(rc, g_dx_ui != nullptr);
     HRGN rgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1, radius, radius);
     SelectClipRgn(dc, rgn);
 
@@ -3164,6 +3217,41 @@ void DrawButtonSurface(HDC dc, const RECT& rc, COLORREF top, COLORREF bottom, CO
     DeleteObject(rgn);
 }
 
+void AddRoundedRectPath(Gdiplus::GraphicsPath* path, const Gdiplus::RectF& rect, float radius) {
+    if (!path) {
+        return;
+    }
+    float diameter = radius * 2.0f;
+    if (diameter <= 0.0f) {
+        path->AddRectangle(rect);
+        return;
+    }
+    Gdiplus::RectF arc(rect.X, rect.Y, diameter, diameter);
+    path->AddArc(arc, 180.0f, 90.0f);
+    arc.X = rect.GetRight() - diameter;
+    path->AddArc(arc, 270.0f, 90.0f);
+    arc.Y = rect.GetBottom() - diameter;
+    path->AddArc(arc, 0.0f, 90.0f);
+    arc.X = rect.X;
+    path->AddArc(arc, 90.0f, 90.0f);
+    path->CloseFigure();
+}
+
+COLORREF BlendColor(COLORREF base, COLORREF overlay, float alpha) {
+    if (alpha <= 0.0f) {
+        return base;
+    }
+    if (alpha >= 1.0f) {
+        return overlay;
+    }
+    auto blend = [alpha](int b, int o) -> BYTE {
+        return static_cast<BYTE>(b + static_cast<int>((o - b) * alpha));
+    };
+    return RGB(blend(GetRValue(base), GetRValue(overlay)),
+               blend(GetGValue(base), GetGValue(overlay)),
+               blend(GetBValue(base), GetBValue(overlay)));
+}
+
 COLORREF GetStatusColor(const std::wstring& status) {
     std::wstring s = ToLowerString(status);
     if (s.find(L"ready") != std::wstring::npos) {
@@ -3194,6 +3282,32 @@ void SetRoundedRegion(HWND hwnd, int radius) {
     SetWindowRgn(hwnd, rgn, TRUE);
 }
 
+int GetButtonCornerRadius(const RECT& rc, bool use_dx) {
+    if (!use_dx) {
+        return Scale(10);
+    }
+    int height = rc.bottom - rc.top;
+    int radius = Scale(12);
+    if (height > 0) {
+        radius = (std::min)(radius, height / 2);
+    }
+    return radius;
+}
+
+void SetButtonRoundedRegion(HWND hwnd, bool use_dx) {
+    if (!hwnd) {
+        return;
+    }
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    if (rc.right <= rc.left || rc.bottom <= rc.top) {
+        return;
+    }
+    SetRoundedRegion(hwnd, GetButtonCornerRadius(rc, use_dx));
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+}
+
 std::wstring ToLowerString(const std::wstring& value) {
     std::wstring out = value;
     for (wchar_t& ch : out) {
@@ -3202,6 +3316,64 @@ std::wstring ToLowerString(const std::wstring& value) {
         }
     }
     return out;
+}
+
+constexpr int kKeyGroupSize = 8;
+
+bool IsKeyChar(wchar_t ch) {
+    return (ch >= L'0' && ch <= L'9') ||
+           (ch >= L'A' && ch <= L'Z') ||
+           (ch >= L'a' && ch <= L'z');
+}
+
+std::wstring NormalizeKeyWide(const std::wstring& input) {
+    std::wstring out;
+    out.reserve(input.size());
+    for (wchar_t ch : input) {
+        if (IsKeyChar(ch)) {
+            out.push_back(static_cast<wchar_t>(std::towupper(ch)));
+        }
+    }
+    return out;
+}
+
+std::wstring FormatKeyDisplay(const std::wstring& input) {
+    std::wstring normalized = NormalizeKeyWide(input);
+    if (normalized.empty()) {
+        return normalized;
+    }
+    std::wstring out;
+    out.reserve(normalized.size() + normalized.size() / kKeyGroupSize);
+    for (size_t i = 0; i < normalized.size(); ++i) {
+        if (i > 0 && (i % kKeyGroupSize) == 0) {
+            out.push_back(L'-');
+        }
+        out.push_back(normalized[i]);
+    }
+    return out;
+}
+
+int CountKeyChars(const std::wstring& input, size_t up_to) {
+    size_t limit = (std::min)(up_to, input.size());
+    int count = 0;
+    for (size_t i = 0; i < limit; ++i) {
+        if (IsKeyChar(input[i])) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int MapKeyIndexToFormatted(int key_index, int total_key_chars) {
+    if (total_key_chars <= 0) {
+        return 0;
+    }
+    key_index = (std::max)(0, (std::min)(key_index, total_key_chars));
+    int dashes = key_index / kKeyGroupSize;
+    if (key_index == total_key_chars && (total_key_chars % kKeyGroupSize) == 0) {
+        dashes = (std::max)(0, dashes - 1);
+    }
+    return key_index + dashes;
 }
 
 HBITMAP CreateAvatarBitmap(COLORREF fill_color, COLORREF ring_color, const wchar_t* label, int size) {
@@ -3340,6 +3512,8 @@ void PopulateProgramsList() {
     InitAvatarList();
     ListView_DeleteAllItems(g_list);
     g_selected_index = -1;
+    g_products_scroll = 0;
+    g_hover_product_index = -1;
     EnterCriticalSection(&g_programs_lock);
     std::vector<ProgramInfo> programs = g_programs;
     LeaveCriticalSection(&g_programs_lock);
@@ -3369,6 +3543,8 @@ void ResetPrograms() {
     g_programs.clear();
     LeaveCriticalSection(&g_programs_lock);
     g_selected_index = -1;
+    g_products_scroll = 0;
+    g_hover_product_index = -1;
     if (g_list) {
         ListView_DeleteAllItems(g_list);
     }
@@ -3379,7 +3555,9 @@ void UpdateButtonText() {
         return;
     }
     if (g_stage == UiStage::Login) {
-        SetWindowTextW(g_button, L"Activate key");
+        SetWindowTextW(g_button, g_dx_ui ? L"AUTHENTICATE" : L"Activate key");
+    } else if (g_dx_ui && g_stage == UiStage::Loading) {
+        SetWindowTextW(g_button, L"Loading");
     } else {
         SetWindowTextW(g_button, L"Load");
     }
@@ -3391,16 +3569,19 @@ void SetStage(UiStage stage) {
     bool connecting = stage == UiStage::Connecting;
     bool dashboard = stage == UiStage::Dashboard;
     bool loading = stage == UiStage::Loading;
-    g_validated = dashboard;
+    bool dx_loading = loading && g_dx_ui;
+    bool dashboard_like = dashboard || dx_loading;
+    g_validated = dashboard_like;
+    g_hover_product_index = -1;
     ShowWindow(g_label_key, login ? SW_SHOW : SW_HIDE);
     ShowWindow(g_edit, login ? SW_SHOW : SW_HIDE);
     if (g_label_programs) {
         if (login) {
             SetWindowTextW(g_label_programs, L"Status");
         } else if (connecting) {
-            SetWindowTextW(g_label_programs, L"Connecting");
+            SetWindowTextW(g_label_programs, g_dx_ui ? L"INITIALIZING" : L"Connecting");
         } else if (loading) {
-            SetWindowTextW(g_label_programs, L"Loader");
+            SetWindowTextW(g_label_programs, g_dx_ui ? L"LOADING" : L"Loader");
         } else {
             SetWindowTextW(g_label_programs, L"Builds");
         }
@@ -3409,8 +3590,13 @@ void SetStage(UiStage stage) {
     ShowWindow(g_label_col_program, SW_HIDE);
     ShowWindow(g_label_col_updated, SW_HIDE);
     ShowWindow(g_label_col_expires, SW_HIDE);
-    ShowWindow(g_list, dashboard ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_button, (login || dashboard) ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_list, (dashboard && !g_dx_ui) ? SW_SHOW : SW_HIDE);
+    bool show_button = (login || (!g_dx_ui && dashboard_like));
+    ShowWindow(g_button, show_button ? SW_SHOW : SW_HIDE);
+    if (g_button && !show_button) {
+        SendMessageW(g_button, BM_SETSTATE, FALSE, 0);
+        g_dx_button_pressed = false;
+    }
     g_status_anim_tick = 0;
     if (!connecting && !loading && !g_status_base.empty()) {
         EnterCriticalSection(&g_status_lock);
@@ -3419,21 +3605,29 @@ void SetStage(UiStage stage) {
         PostMessageW(g_hwnd, kMsgUpdateStatus, 0, 0);
     }
     if (connecting || loading) {
-        if (!g_status_hwnd) {
-            g_status_hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"LoaderStatusWindow", L"u3ware",
-                                            WS_POPUP | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 380, 200,
-                                            nullptr, nullptr, GetModuleHandleW(nullptr), reinterpret_cast<LPVOID>(1));
-            CenterWindow(g_status_hwnd);
+        if (g_dx_ui) {
+            if (g_status_hwnd) {
+                ShowWindow(g_status_hwnd, SW_HIDE);
+            }
+            ShowWindow(g_hwnd, SW_SHOW);
+            CenterWindow(g_hwnd);
+        } else {
+            if (!g_status_hwnd) {
+                g_status_hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"LoaderStatusWindow", L"u3ware",
+                                                WS_POPUP | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 380, 200,
+                                                nullptr, nullptr, GetModuleHandleW(nullptr), reinterpret_cast<LPVOID>(1));
+                CenterWindow(g_status_hwnd);
+            }
+            if (g_status_title) {
+                SetWindowTextW(g_status_title, connecting ? L"Connecting" : L"Loading");
+            }
+            if (g_status_overlay) {
+                ShowWindow(g_status_overlay, SW_HIDE);
+            }
+            ShowWindow(g_hwnd, SW_HIDE);
+            ShowWindow(g_status_hwnd, SW_SHOW);
+            SetForegroundWindow(g_status_hwnd);
         }
-        if (g_status_title) {
-            SetWindowTextW(g_status_title, connecting ? L"Connecting" : L"Loading");
-        }
-        if (g_status_overlay) {
-            ShowWindow(g_status_overlay, SW_HIDE);
-        }
-        ShowWindow(g_hwnd, SW_HIDE);
-        ShowWindow(g_status_hwnd, SW_SHOW);
-        SetForegroundWindow(g_status_hwnd);
     } else {
         if (g_status_hwnd) {
             ShowWindow(g_status_hwnd, SW_HIDE);
@@ -3443,12 +3637,12 @@ void SetStage(UiStage stage) {
     }
     UpdateButtonText();
     if (g_hwnd) {
-        if (login || dashboard) {
-            int width = login ? Scale(480) : Scale(760);
-            int height = login ? Scale(320) : Scale(520);
-            SetWindowPos(g_hwnd, nullptr, 0, 0, width, height, SWP_NOZORDER | SWP_NOMOVE);
-            CenterWindow(g_hwnd);
-        }
+    if (login || dashboard_like) {
+        int width = login ? Scale(480) : Scale(760);
+        int height = login ? Scale(320) : Scale(520);
+        SetWindowPos(g_hwnd, nullptr, 0, 0, width, height, SWP_NOZORDER | SWP_NOMOVE);
+        CenterWindow(g_hwnd);
+    }
         LayoutControls(g_hwnd);
     }
 }
@@ -3462,6 +3656,18 @@ void SetStatus(HWND hwnd, const std::wstring& text) {
         SetWindowTextW(g_status_title, text.c_str());
         InvalidateRect(g_status_hwnd, nullptr, TRUE);
         UpdateWindow(g_status_hwnd);
+    }
+    if (g_dx_ui && g_button && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading)) {
+        std::wstring lower = ToLowerString(text);
+        const wchar_t* label = L"Load";
+        if (lower.find(L"waiting") != std::wstring::npos) {
+            label = L"Waiting for game";
+        } else if (g_stage == UiStage::Loading) {
+            label = L"Loading";
+        }
+        SetWindowTextW(g_button, label);
+        SetButtonRoundedRegion(g_button, g_dx_ui != nullptr);
+        InvalidateRect(g_button, nullptr, g_dx_ui ? FALSE : TRUE);
     }
     PostMessageW(hwnd, kMsgUpdateStatus, 0, 0);
 }
@@ -3503,10 +3709,21 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     };
 
     if (task == TaskType::Validate) {
+        std::wstring normalized_key = NormalizeKeyWide(key);
+        if (normalized_key.empty()) {
+            SetStatus(hwnd, L"Enter a key first");
+            SetStage(UiStage::Login);
+            EnableButton(true);
+            return 0;
+        }
+        key = FormatKeyDisplay(normalized_key);
         // Дополнительная проверка на отладчик перед валидацией (ВРЕМЕННО ОТКЛЮЧЕНА)
         // ANTI_CRACK_CHECK(anti_debug::IsDebuggerDetected());
 
         int validate_attempts = 0;
+        EnterCriticalSection(&g_status_lock);
+        g_last_error_code.clear();
+        LeaveCriticalSection(&g_status_lock);
     validate_retry:
         validate_attempts++;
 
@@ -3567,6 +3784,9 @@ DWORD WINAPI WorkerThread(LPVOID param) {
 
         std::string error_code;
         JsonGetStringTopLevel(response, "error", &error_code);
+        EnterCriticalSection(&g_status_lock);
+        g_last_error_code = ok ? std::string() : error_code;
+        LeaveCriticalSection(&g_status_lock);
         std::string min_version;
         JsonGetStringTopLevel(response, "min_version", &min_version);
         std::string update_url;
@@ -3913,7 +4133,18 @@ void LayoutControls(HWND hwnd) {
     int height = rc.bottom - rc.top;
 
     int x = padding;
-    g_titlebar_height = Scale(46);
+    bool use_dx = (g_dx_ui != nullptr);
+    if (use_dx) {
+        SetRoundedRegion(hwnd, Scale(18));
+    } else {
+        SetWindowRgn(hwnd, nullptr, TRUE);
+    }
+    int base_titlebar_height = Scale(46);
+    int extra_titlebar = 0;
+    if (use_dx && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading)) {
+        extra_titlebar = Scale(40);
+    }
+    g_titlebar_height = base_titlebar_height + extra_titlebar;
     int y = g_titlebar_height + Scale(12);
     int field_width = width - padding * 2;
     int button_width = Scale(180);
@@ -3929,15 +4160,21 @@ void LayoutControls(HWND hwnd) {
     int body_height = GetFontHeight(hwnd, g_body_font);
     int edit_height = body_height + Scale(8);
     int button_height = body_height + Scale(12);
+    if (use_dx && g_stage == UiStage::Login) {
+        button_height = Scale(44);
+    }
+    if (use_dx && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading)) {
+        button_height = Scale(46);
+    }
     int status_height = label_height;
     int column_height = label_height;
     int card_padding = Scale(18);
 
-    int title_y = (g_titlebar_height - title_height) / 2;
+    int title_y = (base_titlebar_height - title_height) / 2;
     MoveWindow(g_title, x, title_y, field_width, title_height, TRUE);
 
     int button_size = Scale(28);
-    int button_y = (g_titlebar_height - button_size) / 2;
+    int button_y = (base_titlebar_height - button_size) / 2;
     int button_right = width - Scale(16);
     g_btn_close = {button_right - button_size, button_y, button_right, button_y + button_size};
     g_btn_min = {g_btn_close.left - Scale(10) - button_size, button_y, g_btn_close.left - Scale(10), button_y + button_size};
@@ -3945,7 +4182,74 @@ void LayoutControls(HWND hwnd) {
     MoveWindow(g_subtitle, x, y, field_width, subtitle_height, TRUE);
     y += subtitle_height + Scale(20);
 
-    if (g_stage == UiStage::Login) {
+    if (g_title) {
+        ShowWindow(g_title, use_dx ? SW_HIDE : SW_SHOW);
+    }
+    if (g_subtitle) {
+        ShowWindow(g_subtitle, use_dx ? SW_HIDE : SW_SHOW);
+    }
+    if (!(use_dx && g_stage == UiStage::Login)) {
+        if (g_label_key) {
+            ShowWindow(g_label_key, g_stage == UiStage::Login ? SW_SHOW : SW_HIDE);
+        }
+        if (g_status) {
+            ShowWindow(g_status, SW_SHOW);
+        }
+    }
+
+    if (g_stage == UiStage::Login && use_dx) {
+        int content_top = g_titlebar_height + Scale(20);
+        int card_width = min(field_width, Scale(440));
+        int left = (width - card_width) / 2;
+        int spacing = Scale(10);
+        int field_height = Scale(44);
+        int card_height = card_padding * 2 + label_height + spacing + field_height + Scale(12) + button_height +
+                          spacing + status_height;
+        int available_height = height - content_top - padding;
+        int top = content_top;
+        if (available_height > card_height) {
+            top = content_top + (available_height - card_height) / 2;
+        }
+
+        int inner_x = left + card_padding;
+        int inner_y = top + card_padding;
+        int inner_width = card_width - card_padding * 2;
+
+        if (g_label_key) {
+            SetWindowTextW(g_label_key, L"PRODUCT KEY");
+        }
+        MoveWindow(g_label_key, inner_x, inner_y, inner_width, label_height, TRUE);
+        inner_y += label_height + spacing;
+
+        int field_padding_x = Scale(12);
+        int field_padding_y = (std::max)(0, (field_height - edit_height) / 2);
+        g_field_key = {inner_x, inner_y, inner_x + inner_width, inner_y + field_height};
+        MoveWindow(g_edit, inner_x + field_padding_x, inner_y + field_padding_y,
+                   inner_width - field_padding_x * 2, edit_height, TRUE);
+        inner_y += field_height + Scale(12);
+
+        MoveWindow(g_button, inner_x, inner_y, inner_width, button_height, TRUE);
+        SetButtonRoundedRegion(g_button, use_dx);
+        inner_y += button_height + spacing;
+
+        MoveWindow(g_status, inner_x, inner_y, inner_width, status_height, TRUE);
+
+        g_card_auth = {left, top, left + card_width, top + card_height};
+        g_card_programs = {};
+        g_card_telemetry = {};
+        g_table_header = {};
+
+        if (g_label_programs) {
+            ShowWindow(g_label_programs, SW_HIDE);
+        }
+        ShowWindow(g_label_key, SW_HIDE);
+        ShowWindow(g_status, SW_HIDE);
+        ShowWindow(g_label_col_program, SW_HIDE);
+        ShowWindow(g_label_col_updated, SW_HIDE);
+        ShowWindow(g_label_col_expires, SW_HIDE);
+        ShowWindow(g_list, SW_HIDE);
+    } else if (g_stage == UiStage::Login) {
+        g_field_key = {};
         int card_width = min(field_width, Scale(900));
         int card_left = (width - card_width) / 2;
         int panel_gap = Scale(20);
@@ -3963,7 +4267,7 @@ void LayoutControls(HWND hwnd) {
         left_y += edit_height + Scale(12);
 
         MoveWindow(g_button, left_left + card_padding, left_y, left_field_width, button_height, TRUE);
-        SetRoundedRegion(g_button, Scale(10));
+        SetButtonRoundedRegion(g_button, use_dx);
         left_y += button_height + Scale(12);
         g_card_auth = {left_left, left_top, left_left + left_width, left_y + card_padding};
 
@@ -3977,7 +4281,8 @@ void LayoutControls(HWND hwnd) {
         right_y += status_height + Scale(12);
         g_card_programs = {right_left, right_top, right_left + right_width, right_y + card_padding};
         g_table_header = {};
-    } else if (g_stage == UiStage::Connecting || g_stage == UiStage::Loading) {
+    } else if (g_stage == UiStage::Connecting || (!use_dx && g_stage == UiStage::Loading)) {
+        g_field_key = {};
         int card_width = min(field_width, Scale(540));
         int card_height = Scale(190);
         int card_left = (width - card_width) / 2;
@@ -3985,44 +4290,181 @@ void LayoutControls(HWND hwnd) {
         int card_padding = Scale(18);
         g_card_auth = {card_left, card_top, card_left + card_width, card_top + card_height};
         g_card_programs = {};
+        g_card_telemetry = {};
         g_table_header = {};
 
         int header_y = card_top + card_padding;
         MoveWindow(g_label_programs, card_left + card_padding, header_y, card_width - card_padding * 2, header_height, TRUE);
         header_y += header_height + Scale(10);
         MoveWindow(g_status, card_left + card_padding, header_y, card_width - card_padding * 2, status_height, TRUE);
-    } else {
-        int panel_width = min(field_width, Scale(900));
-        int panel_left = (width - panel_width) / 2;
-        int panel_padding = Scale(16);
-
-        int toolbar_top = y;
-        int header_y = toolbar_top + panel_padding;
-        MoveWindow(g_label_programs, panel_left + panel_padding, header_y,
-                   panel_width - panel_padding * 2 - button_width - Scale(12), header_height, TRUE);
-        MoveWindow(g_button, panel_left + panel_width - panel_padding - button_width, header_y - Scale(4), button_width, button_height, TRUE);
-        SetRoundedRegion(g_button, Scale(10));
-        header_y += header_height + Scale(8);
-        MoveWindow(g_status, panel_left + panel_padding, header_y, panel_width - panel_padding * 2, status_height, TRUE);
-        int toolbar_bottom = header_y + status_height + panel_padding;
-        g_card_auth = {panel_left, toolbar_top, panel_left + panel_width, toolbar_bottom};
-
-        int list_top = toolbar_bottom + Scale(16);
-        int list_padding = Scale(14);
-        int list_width = panel_width - list_padding * 2;
-        int list_y = list_top + list_padding;
-        int list_height = height - list_y - padding;
-        if (g_list) {
-            MoveWindow(g_list, panel_left + list_padding, list_y, list_width, list_height, TRUE);
-            ListView_SetColumnWidth(g_list, 0, list_width);
-            ListView_SetColumnWidth(g_list, 1, 0);
-            ListView_SetColumnWidth(g_list, 2, 0);
+        if (use_dx) {
+            ShowWindow(g_label_programs, SW_HIDE);
+            ShowWindow(g_status, SW_HIDE);
         }
+    } else {
+        g_field_key = {};
+        if (use_dx) {
+            int content_top = g_titlebar_height + Scale(20);
+            int panel_width = min(field_width, Scale(980));
+            int panel_left = (width - panel_width) / 2;
+            int gap = Scale(14);
+            int card_padding = Scale(14);
+            int available_height = height - content_top - padding;
+            int telemetry_height = Scale(200);
+            int top_row_height = available_height - telemetry_height - gap;
+            if (top_row_height < Scale(200)) {
+                telemetry_height = (std::max)(Scale(140), available_height - gap - Scale(200));
+                top_row_height = available_height - telemetry_height - gap;
+            }
+            int row_top = content_top;
+            int left_width = static_cast<int>((panel_width - gap) * 0.57f);
+            int right_width = panel_width - gap - left_width;
 
-        g_table_header = {};
-        g_card_programs = {panel_left, list_top, panel_left + panel_width, list_y + list_height + list_padding};
+            int left_left = panel_left;
+            int right_left = panel_left + left_width + gap;
+            int row_bottom = row_top + top_row_height;
+            g_card_auth = {left_left, row_top, left_left + left_width, row_bottom};
+            g_card_programs = {right_left, row_top, right_left + right_width, row_bottom};
+            g_card_telemetry = {panel_left, row_bottom + gap, panel_left + panel_width, row_bottom + gap + telemetry_height};
+            g_table_header = {};
+
+            int left_inner_x = left_left + card_padding;
+            int left_inner_y = row_top + card_padding + header_height + Scale(10);
+            int left_inner_width = left_width - card_padding * 2;
+            int left_inner_height = row_bottom - card_padding - left_inner_y;
+            if (g_list) {
+                MoveWindow(g_list, left_inner_x, left_inner_y, left_inner_width, left_inner_height, TRUE);
+                ListView_SetColumnWidth(g_list, 0, left_inner_width);
+                ListView_SetColumnWidth(g_list, 1, 0);
+                ListView_SetColumnWidth(g_list, 2, 0);
+                ShowWindow(g_list, SW_HIDE);
+            }
+
+            int right_inner_x = right_left + card_padding;
+            int right_inner_width = right_width - card_padding * 2;
+            int right_header_y = row_top + card_padding;
+            int button_y = right_header_y + header_height + Scale(12);
+            MoveWindow(g_button, right_inner_x, button_y, right_inner_width, button_height, TRUE);
+            SetButtonRoundedRegion(g_button, use_dx);
+            int status_y = button_y + button_height + Scale(12);
+            MoveWindow(g_status, right_inner_x, status_y, right_inner_width, status_height, TRUE);
+
+            ShowWindow(g_label_programs, SW_HIDE);
+            ShowWindow(g_status, SW_HIDE);
+        } else {
+            int panel_width = min(field_width, Scale(900));
+            int panel_left = (width - panel_width) / 2;
+            int panel_padding = Scale(16);
+
+            int toolbar_top = y;
+            int header_y = toolbar_top + panel_padding;
+            MoveWindow(g_label_programs, panel_left + panel_padding, header_y,
+                       panel_width - panel_padding * 2 - button_width - Scale(12), header_height, TRUE);
+            MoveWindow(g_button, panel_left + panel_width - panel_padding - button_width, header_y - Scale(4), button_width, button_height, TRUE);
+            SetButtonRoundedRegion(g_button, use_dx);
+            header_y += header_height + Scale(8);
+            MoveWindow(g_status, panel_left + panel_padding, header_y, panel_width - panel_padding * 2, status_height, TRUE);
+            int toolbar_bottom = header_y + status_height + panel_padding;
+            g_card_auth = {panel_left, toolbar_top, panel_left + panel_width, toolbar_bottom};
+
+            int list_top = toolbar_bottom + Scale(16);
+            int list_padding = Scale(14);
+            int list_width = panel_width - list_padding * 2;
+            int list_y = list_top + list_padding;
+            int list_height = height - list_y - padding;
+            if (g_list) {
+                MoveWindow(g_list, panel_left + list_padding, list_y, list_width, list_height, TRUE);
+                ListView_SetColumnWidth(g_list, 0, list_width);
+                ListView_SetColumnWidth(g_list, 1, 0);
+                ListView_SetColumnWidth(g_list, 2, 0);
+            }
+
+            g_table_header = {};
+            g_card_programs = {panel_left, list_top, panel_left + panel_width, list_y + list_height + list_padding};
+            g_card_telemetry = {};
+        }
     }
-    InvalidateRect(hwnd, nullptr, TRUE);
+    InvalidateRect(hwnd, nullptr, g_dx_ui ? FALSE : TRUE);
+}
+
+struct DxProductsLayout {
+    RECT list = {};
+    int item_height = 0;
+    int item_gap = 0;
+    int visible = 0;
+    int total = 0;
+};
+
+bool GetDxProductsLayout(DxProductsLayout* layout) {
+    if (!layout || !g_dx_ui || IsRectEmpty(&g_card_auth)) {
+        return false;
+    }
+    if (g_stage != UiStage::Dashboard && g_stage != UiStage::Loading) {
+        return false;
+    }
+
+    int pad = Scale(kDxUiCardPadding);
+    int header = Scale(kDxUiHeaderHeight);
+    int gap = Scale(kDxUiListItemGap);
+    int item_height = Scale(kDxUiListItemHeight);
+    int top = g_card_auth.top + pad + header + Scale(10);
+    int left = g_card_auth.left + pad;
+    int right = g_card_auth.right - pad;
+    int bottom = g_card_auth.bottom - pad;
+    if (right <= left || bottom <= top) {
+        return false;
+    }
+
+    int list_height = bottom - top;
+    int visible = (list_height + gap) / (item_height + gap);
+    if (visible < 1) {
+        visible = 1;
+    }
+
+    int total = 0;
+    EnterCriticalSection(&g_programs_lock);
+    total = static_cast<int>(g_programs.size());
+    LeaveCriticalSection(&g_programs_lock);
+
+    layout->list = {left, top, right, bottom};
+    layout->item_height = item_height;
+    layout->item_gap = gap;
+    layout->visible = visible;
+    layout->total = total;
+    return true;
+}
+
+bool HitTestDxProductList(POINT pt, int* out_index) {
+    DxProductsLayout layout;
+    if (!GetDxProductsLayout(&layout)) {
+        return false;
+    }
+    if (!PtInRect(&layout.list, pt)) {
+        return false;
+    }
+
+    int max_scroll = (std::max)(0, layout.total - layout.visible);
+    int scroll = (std::min)((std::max)(g_products_scroll, 0), max_scroll);
+
+    int rel_y = pt.y - layout.list.top;
+    int slot = rel_y / (layout.item_height + layout.item_gap);
+    if (slot < 0 || slot >= layout.visible) {
+        return false;
+    }
+
+    int item_top = layout.list.top + slot * (layout.item_height + layout.item_gap);
+    if (pt.y > item_top + layout.item_height) {
+        return false;
+    }
+
+    int index = scroll + slot;
+    if (index < 0 || index >= layout.total) {
+        return false;
+    }
+    if (out_index) {
+        *out_index = index;
+    }
+    return true;
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -4128,12 +4570,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             CreateFonts();
             StartGdiPlus();
 
-            LONG_PTR ex_style = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-            SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED);
-            SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
-            g_fade_active = true;
-            g_fade_alpha = 0;
-            SetTimer(hwnd, kUiTimerId, 80, nullptr);
+            if (kEnableDxUi) {
+                g_dx_ui = std::make_unique<DxUiRenderer>();
+                if (!g_dx_ui->Initialize(hwnd)) {
+                    g_dx_ui.reset();
+                } else {
+                    g_dx_ui->SetDpi(g_dpi);
+                }
+            }
+
+            if (!g_dx_ui) {
+                LONG_PTR ex_style = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+                SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED);
+                SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+                g_fade_active = true;
+                g_fade_alpha = 0;
+            } else {
+                g_fade_active = false;
+                g_fade_alpha = 255;
+                LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
+                SetWindowLongPtr(hwnd, GWL_STYLE, style | WS_CLIPCHILDREN | WS_CLIPSIBLINGS);
+                SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+            }
+            UINT timer_ms = g_dx_ui ? 16 : 80;
+            SetTimer(hwnd, kUiTimerId, timer_ms, nullptr);
 
             g_title = CreateWindowW(L"STATIC", L"u3ware", WS_CHILD | WS_VISIBLE,
                                     0, 0, 0, 0, hwnd, nullptr, nullptr, nullptr);
@@ -4147,6 +4608,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
             g_button = CreateWindowW(L"BUTTON", L"Validate key", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                                      0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(kControlIdButton)), nullptr, nullptr);
+            if (g_button) {
+                SetWindowSubclass(g_button, ButtonSubclassProc, 0, 0);
+                if (g_dx_ui) {
+                    ConfigureDxButtonWindow(g_button);
+                }
+            }
 
             g_status = CreateWindowW(L"STATIC", L"Paste your key to continue", WS_CHILD | WS_VISIBLE,
                                      0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(kControlIdStatus)), nullptr, nullptr);
@@ -4190,9 +4657,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             LayoutControls(hwnd);
             return 0;
         }
-        case WM_SIZE:
+        case WM_SIZE: {
+            if (g_dx_ui) {
+                g_dx_ui->Resize(LOWORD(lparam), HIWORD(lparam));
+            }
             LayoutControls(hwnd);
             return 0;
+        }
         case WM_NCCALCSIZE:
             return 0;
         case WM_NCHITTEST: {
@@ -4215,6 +4686,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             RECT* rect = reinterpret_cast<RECT*>(lparam);
             SetWindowPos(hwnd, nullptr, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+            if (g_dx_ui) {
+                g_dx_ui->SetDpi(g_dpi);
+            }
             CreateFonts();
             ApplyFonts();
             InitAvatarList();
@@ -4228,10 +4702,94 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             }
             break;
         }
+        case WM_KEYDOWN: {
+            if (g_dx_ui && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading)) {
+                DxProductsLayout layout;
+                if (!GetDxProductsLayout(&layout) || layout.total <= 0) {
+                    break;
+                }
+
+                int index = g_selected_index;
+                if (index < 0) {
+                    index = 0;
+                }
+                int next = index;
+                switch (wparam) {
+                    case VK_UP:
+                        next = (std::max)(0, index - 1);
+                        break;
+                    case VK_DOWN:
+                        next = (std::min)(layout.total - 1, index + 1);
+                        break;
+                    case VK_HOME:
+                        next = 0;
+                        break;
+                    case VK_END:
+                        next = layout.total - 1;
+                        break;
+                    case VK_PRIOR:
+                        next = (std::max)(0, index - layout.visible);
+                        break;
+                    case VK_NEXT:
+                        next = (std::min)(layout.total - 1, index + layout.visible);
+                        break;
+                    case VK_RETURN:
+                        if (g_button && IsWindowEnabled(g_button)) {
+                            SendMessageW(hwnd, WM_COMMAND,
+                                         MAKEWPARAM(kControlIdButton, BN_CLICKED),
+                                         reinterpret_cast<LPARAM>(g_button));
+                            return 0;
+                        }
+                        break;
+                    default:
+                        break;
+                }
+
+                if (next != index) {
+                    g_selected_index = next;
+                    g_hover_product_index = -1;
+                    g_keyboard_nav_active = true;
+                    int max_scroll = (std::max)(0, layout.total - layout.visible);
+                    if (g_selected_index < g_products_scroll) {
+                        g_products_scroll = g_selected_index;
+                    } else if (g_selected_index >= g_products_scroll + layout.visible) {
+                        g_products_scroll = g_selected_index - layout.visible + 1;
+                    }
+                    g_products_scroll = (std::min)((std::max)(g_products_scroll, 0), max_scroll);
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                    return 0;
+                }
+            }
+            break;
+        }
         case WM_COMMAND:
             if (LOWORD(wparam) == kControlIdEdit && HIWORD(wparam) == EN_CHANGE) {
                 if (g_ignore_key_change) {
                     return 0;
+                }
+                int text_len = GetWindowTextLengthW(g_edit);
+                std::wstring raw(text_len + 1, L'\0');
+                int copied = GetWindowTextW(g_edit, &raw[0], text_len + 1);
+                if (copied < 0) {
+                    copied = 0;
+                }
+                raw.resize(static_cast<size_t>(copied));
+                DWORD sel_start = 0;
+                DWORD sel_end = 0;
+                SendMessageW(g_edit, EM_GETSEL, reinterpret_cast<WPARAM>(&sel_start),
+                             reinterpret_cast<LPARAM>(&sel_end));
+                int key_before_start = CountKeyChars(raw, static_cast<size_t>(sel_start));
+                int key_before_end = CountKeyChars(raw, static_cast<size_t>(sel_end));
+                std::wstring normalized = NormalizeKeyWide(raw);
+                std::wstring formatted = FormatKeyDisplay(normalized);
+                if (formatted != raw) {
+                    g_ignore_key_change = true;
+                    SetWindowTextW(g_edit, formatted.c_str());
+                    int total_keys = static_cast<int>(normalized.size());
+                    int new_start = MapKeyIndexToFormatted(key_before_start, total_keys);
+                    int new_end = MapKeyIndexToFormatted(key_before_end, total_keys);
+                    SendMessageW(g_edit, EM_SETSEL, new_start, new_end);
+                    g_ignore_key_change = false;
                 }
                 if (g_stage != UiStage::Login) {
                     SetStage(UiStage::Login);
@@ -4239,15 +4797,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 }
                 ClearSavedKey();
                 g_cached_key.clear();
+                EnterCriticalSection(&g_status_lock);
+                g_last_error_code.clear();
+                LeaveCriticalSection(&g_status_lock);
                 SetStatus(hwnd, L"Enter a key to continue");
                 return 0;
             }
             if (LOWORD(wparam) == kControlIdButton) {
                 if (g_stage == UiStage::Login) {
-                    wchar_t key_buffer[256] = {};
-                    GetWindowTextW(g_edit, key_buffer, static_cast<int>(sizeof(key_buffer) / sizeof(key_buffer[0])));
-                    std::wstring key(key_buffer);
+                    int text_len = GetWindowTextLengthW(g_edit);
+                    std::wstring raw(text_len + 1, L'\0');
+                    int copied = GetWindowTextW(g_edit, &raw[0], text_len + 1);
+                    if (copied < 0) {
+                        copied = 0;
+                    }
+                    raw.resize(static_cast<size_t>(copied));
+                    std::wstring key = NormalizeKeyWide(raw);
                     if (key.empty()) {
+                        EnterCriticalSection(&g_status_lock);
+                        g_last_error_code.clear();
+                        LeaveCriticalSection(&g_status_lock);
                         SetStatus(hwnd, L"Enter a key first");
                         return 0;
                     }
@@ -4295,6 +4864,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 InvalidateRect(hwnd, &g_btn_min, TRUE);
                 return 0;
             }
+            if (g_dx_ui && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading)) {
+                if (g_button && IsWindowEnabled(g_button)) {
+                    RECT button_rect = {};
+                    if (GetWindowRect(g_button, &button_rect)) {
+                        MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&button_rect), 2);
+                        if (PtInRect(&button_rect, pt)) {
+                            g_dx_button_pressed = true;
+                            SendMessageW(g_button, BM_SETSTATE, TRUE, 0);
+                            SetCapture(hwnd);
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                            return 0;
+                        }
+                    }
+                }
+            }
+            if (g_dx_ui && g_stage == UiStage::Dashboard) {
+                int index = -1;
+                if (HitTestDxProductList(pt, &index)) {
+                    if (index != g_selected_index) {
+                        g_selected_index = index;
+                        g_keyboard_nav_active = false;
+                        InvalidateRect(hwnd, nullptr, TRUE);
+                    }
+                    return 0;
+                }
+            }
             break;
         }
         case WM_LBUTTONUP: {
@@ -4314,10 +4909,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 }
                 return 0;
             }
+            if (g_dx_button_pressed) {
+                g_dx_button_pressed = false;
+                if (g_button) {
+                    SendMessageW(g_button, BM_SETSTATE, FALSE, 0);
+                }
+                ReleaseCapture();
+                if (g_dx_ui && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading) &&
+                    g_button && IsWindowEnabled(g_button)) {
+                    POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                    RECT button_rect = {};
+                    if (GetWindowRect(g_button, &button_rect)) {
+                        MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&button_rect), 2);
+                        if (PtInRect(&button_rect, pt)) {
+                            SendMessageW(hwnd, WM_COMMAND,
+                                         MAKEWPARAM(kControlIdButton, BN_CLICKED),
+                                         reinterpret_cast<LPARAM>(g_button));
+                        }
+                    }
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             break;
         }
         case WM_MOUSEMOVE: {
             POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            g_mouse_pos = pt;
+            g_mouse_in_window = true;
             bool hover_close = PtInRect(&g_btn_close, pt);
             bool hover_min = PtInRect(&g_btn_min, pt);
             if (hover_close != g_hover_close || hover_min != g_hover_min) {
@@ -4325,6 +4944,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 g_hover_min = hover_min;
                 InvalidateRect(hwnd, &g_btn_close, TRUE);
                 InvalidateRect(hwnd, &g_btn_min, TRUE);
+            }
+            if (g_button) {
+                RECT button_rect = {};
+                if (GetWindowRect(g_button, &button_rect)) {
+                    MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&button_rect), 2);
+                    bool over = PtInRect(&button_rect, pt) != FALSE;
+                    if (over) {
+                        POINT local = {pt.x - button_rect.left, pt.y - button_rect.top};
+                        if (!g_button_hover ||
+                            std::abs(local.x - g_button_hover_pt.x) > 1 ||
+                            std::abs(local.y - g_button_hover_pt.y) > 1) {
+                            g_button_hover = true;
+                            g_button_hover_pt = local;
+                            InvalidateRect(g_button, nullptr, g_dx_ui ? FALSE : TRUE);
+                        }
+                    } else if (g_button_hover) {
+                        g_button_hover = false;
+                        InvalidateRect(g_button, nullptr, g_dx_ui ? FALSE : TRUE);
+                    }
+                }
             }
             if (!g_tracking_mouse) {
                 TRACKMOUSEEVENT tme = {};
@@ -4335,17 +4974,69 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                     g_tracking_mouse = true;
                 }
             }
+            if (g_dx_ui && g_stage == UiStage::Dashboard) {
+                int hover_index = -1;
+                if (!HitTestDxProductList(pt, &hover_index)) {
+                    hover_index = -1;
+                }
+                if (hover_index != -1 && g_keyboard_nav_active) {
+                    g_keyboard_nav_active = false;
+                }
+                if (hover_index != g_hover_product_index) {
+                    g_hover_product_index = hover_index;
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                }
+            }
+            if (g_dx_ui && g_stage == UiStage::Login) {
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
             break;
         }
         case WM_MOUSELEAVE:
             g_tracking_mouse = false;
+            g_mouse_in_window = false;
             if (g_hover_close || g_hover_min) {
                 g_hover_close = false;
                 g_hover_min = false;
                 InvalidateRect(hwnd, &g_btn_close, TRUE);
                 InvalidateRect(hwnd, &g_btn_min, TRUE);
             }
+            if (g_hover_product_index != -1) {
+                g_hover_product_index = -1;
+                InvalidateRect(hwnd, nullptr, TRUE);
+            }
+            if (g_button_hover) {
+                g_button_hover = false;
+                InvalidateRect(g_button, nullptr, g_dx_ui ? FALSE : TRUE);
+            }
             return 0;
+        case WM_MOUSEWHEEL: {
+            if (g_dx_ui && g_stage == UiStage::Dashboard) {
+                DxProductsLayout layout;
+                if (GetDxProductsLayout(&layout)) {
+                    POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                    ScreenToClient(hwnd, &pt);
+                    if (!PtInRect(&layout.list, pt)) {
+                        break;
+                    }
+                    int max_scroll = (std::max)(0, layout.total - layout.visible);
+                    if (max_scroll > 0) {
+                        int step = GET_WHEEL_DELTA_WPARAM(wparam) / WHEEL_DELTA;
+                        if (step != 0) {
+                            int next = g_products_scroll - step;
+                            next = (std::max)(0, (std::min)(next, max_scroll));
+                            if (next != g_products_scroll) {
+                                g_products_scroll = next;
+                                g_hover_product_index = -1;
+                                InvalidateRect(hwnd, nullptr, TRUE);
+                                return 0;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
         case WM_NOTIFY: {
             auto* header = reinterpret_cast<NMHDR*>(lparam);
             if (header && header->hwndFrom == g_list && header->code == NM_CUSTOMDRAW) {
@@ -4384,11 +5075,169 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         case WM_DRAWITEM: {
             auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
             if (dis->CtlID == kControlIdButton) {
+                if (g_dx_ui && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading)) {
+                    return TRUE;
+                }
                 HDC dc = dis->hDC;
                 RECT rect = dis->rcItem;
+                if (g_dx_ui) {
+                    SetButtonRoundedRegion(dis->hwndItem, true);
+                }
+                int width = rect.right - rect.left;
+                int height = rect.bottom - rect.top;
+                HDC paint_dc = dc;
+                HBITMAP buffer = nullptr;
+                HBITMAP old_bmp = nullptr;
+                HDC mem_dc = nullptr;
+                RECT paint_rect = rect;
+                if (g_dx_ui && width > 0 && height > 0) {
+                    mem_dc = CreateCompatibleDC(dc);
+                    if (mem_dc) {
+                        buffer = CreateCompatibleBitmap(dc, width, height);
+                        if (buffer) {
+                            old_bmp = reinterpret_cast<HBITMAP>(SelectObject(mem_dc, buffer));
+                            paint_dc = mem_dc;
+                            paint_rect = {0, 0, width, height};
+                        } else {
+                            DeleteDC(mem_dc);
+                            mem_dc = nullptr;
+                        }
+                    }
+                }
+                if (mem_dc) {
+                    HBRUSH back_brush = g_panel_brush;
+                    if (back_brush) {
+                        FillRect(mem_dc, &paint_rect, back_brush);
+                    }
+                }
+                int paint_width = paint_rect.right - paint_rect.left;
+                int paint_height = paint_rect.bottom - paint_rect.top;
 
                 bool enabled = IsWindowEnabled(dis->hwndItem) != FALSE;
                 bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+                bool focused = (GetFocus() == dis->hwndItem);
+                if (g_dx_ui && g_stage == UiStage::Login) {
+                    if (g_panel_brush) {
+                        int radius = GetButtonCornerRadius(paint_rect, g_dx_ui != nullptr);
+                        HRGN clip = CreateRoundRectRgn(paint_rect.left, paint_rect.top,
+                                                       paint_rect.right + 1, paint_rect.bottom + 1,
+                                                       radius, radius);
+                        int saved = SaveDC(paint_dc);
+                        SelectClipRgn(paint_dc, clip);
+                        FillRect(paint_dc, &paint_rect, g_panel_brush);
+                        RestoreDC(paint_dc, saved);
+                        DeleteObject(clip);
+                    }
+                    std::wstring status_snapshot;
+                    EnterCriticalSection(&g_status_lock);
+                    status_snapshot = g_status_text;
+                    LeaveCriticalSection(&g_status_lock);
+                    std::wstring status_lower = ToLowerString(status_snapshot);
+                    bool waiting = (g_stage != UiStage::Login &&
+                                    status_lower.find(L"waiting") != std::wstring::npos);
+                    COLORREF base = kSurfaceAlt;
+                    COLORREF accent = waiting ? RGB(255, 176, 32) : kAccentColor;
+                    COLORREF top = base;
+                    COLORREF bottom = base;
+                    COLORREF border = kSurfaceBorder;
+                    float strength = enabled ? (waiting ? 0.9f : 1.0f) : 0.35f;
+                    float top_alpha = pressed ? 0.18f : 0.22f;
+                    float bottom_alpha = pressed ? 0.08f : 0.10f;
+                    top = BlendColor(base, accent, top_alpha * strength);
+                    bottom = BlendColor(base, accent, bottom_alpha * strength);
+                    border = BlendColor(base, accent, (pressed ? 0.22f : 0.28f) * strength);
+                    DrawButtonSurface(paint_dc, paint_rect, top, bottom, border);
+
+                    bool show_spinner = (g_stage == UiStage::Loading) || waiting;
+                    COLORREF spinner_color = waiting ? RGB(255, 176, 32) : accent;
+                    bool use_effects = g_gdiplus_started &&
+                                       ((g_button_hover && enabled) || show_spinner || (focused && enabled));
+                    if (use_effects) {
+                        Gdiplus::Graphics graphics(paint_dc);
+                        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+                        Gdiplus::RectF clip_rect(static_cast<Gdiplus::REAL>(paint_rect.left),
+                                                 static_cast<Gdiplus::REAL>(paint_rect.top),
+                                                 static_cast<Gdiplus::REAL>(paint_width),
+                                                 static_cast<Gdiplus::REAL>(paint_height));
+                        float clip_radius =
+                            static_cast<float>(GetButtonCornerRadius(paint_rect, g_dx_ui != nullptr)) * 0.5f;
+                        Gdiplus::GraphicsPath clip_path;
+                        AddRoundedRectPath(&clip_path, clip_rect, clip_radius);
+                        graphics.SetClip(&clip_path, Gdiplus::CombineModeReplace);
+
+                        if (g_button_hover && enabled) {
+                            float draw_width = static_cast<float>(paint_width);
+                            float draw_height = static_cast<float>(paint_height);
+                            float glow_w = (std::min)(draw_width * 0.9f, static_cast<float>(Scale(180)));
+                            float glow_h = (std::min)(draw_height * 0.9f, static_cast<float>(Scale(80)));
+                            float cx = static_cast<float>(paint_rect.left + g_button_hover_pt.x);
+                            float cy = static_cast<float>(paint_rect.top + g_button_hover_pt.y);
+
+                            Gdiplus::GraphicsPath path;
+                            path.AddEllipse(cx - glow_w * 0.5f, cy - glow_h * 0.5f, glow_w, glow_h);
+
+                            Gdiplus::PathGradientBrush brush(&path);
+                            Gdiplus::Color center(70, GetRValue(accent), GetGValue(accent), GetBValue(accent));
+                            brush.SetCenterColor(center);
+                            Gdiplus::Color surround(0, GetRValue(accent), GetGValue(accent), GetBValue(accent));
+                            int count = 1;
+                            brush.SetSurroundColors(&surround, &count);
+                            graphics.FillPath(&brush, &path);
+                        }
+
+                        if (show_spinner) {
+                            float draw_width = static_cast<float>(paint_width);
+                            float draw_height = static_cast<float>(paint_height);
+                            float spin_size = (std::min)(draw_width, draw_height) * 0.45f;
+                            spin_size = (std::min)((std::max)(spin_size, 10.0f), 16.0f);
+                            float spin_x = static_cast<float>(paint_rect.left + Scale(12));
+                            float spin_y = static_cast<float>(paint_rect.top) + (draw_height - spin_size) * 0.5f;
+                            float angle = static_cast<float>((GetTickCount64() % 900ULL) / 900.0f) * 360.0f;
+                            Gdiplus::RectF spin_rect(spin_x, spin_y, spin_size, spin_size);
+                            Gdiplus::Pen pen(Gdiplus::Color(220, GetRValue(spinner_color), GetGValue(spinner_color),
+                                                            GetBValue(spinner_color)),
+                                             2.0f);
+                            graphics.DrawArc(&pen, spin_rect, angle, 270.0f);
+                        }
+
+                        if (focused && enabled) {
+                            float inset = static_cast<float>(Scale(2));
+                            float draw_width = static_cast<float>(paint_width);
+                            float draw_height = static_cast<float>(paint_height);
+                            Gdiplus::RectF ring(paint_rect.left + inset, paint_rect.top + inset,
+                                                draw_width - inset * 2.0f, draw_height - inset * 2.0f);
+                            float radius = (std::max)(
+                                0.0f,
+                                static_cast<float>(GetButtonCornerRadius(paint_rect, g_dx_ui != nullptr)) * 0.5f -
+                                    inset);
+                            Gdiplus::GraphicsPath path;
+                            AddRoundedRectPath(&path, ring, radius);
+                            Gdiplus::Color ring_color(180, GetRValue(accent), GetGValue(accent), GetBValue(accent));
+                            Gdiplus::Pen pen(ring_color, 2.0f);
+                            pen.SetAlignment(Gdiplus::PenAlignmentInset);
+                            graphics.DrawPath(&pen, &path);
+                        }
+                    }
+
+                    SetBkMode(paint_dc, TRANSPARENT);
+                    SetTextColor(paint_dc, enabled ? kTextColor : kMutedColor);
+
+                    wchar_t text[64] = {};
+                    GetWindowTextW(dis->hwndItem, text, static_cast<int>(sizeof(text) / sizeof(text[0])));
+                    RECT text_rect = paint_rect;
+                    if (show_spinner) {
+                        text_rect.left += Scale(16);
+                    }
+                    DrawTextW(paint_dc, text, -1, &text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                    if (mem_dc && buffer) {
+                        BitBlt(dc, rect.left, rect.top, width, height, mem_dc, 0, 0, SRCCOPY);
+                        SelectObject(mem_dc, old_bmp);
+                        DeleteObject(buffer);
+                        DeleteDC(mem_dc);
+                    }
+                    return TRUE;
+                }
                 if (g_panel_brush) {
                     FillRect(dc, &rect, g_panel_brush);
                 }
@@ -4409,7 +5258,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         }
         case WM_PAINT: {
             PAINTSTRUCT ps = {};
-            HDC dc = BeginPaint(hwnd, &ps);
+            BeginPaint(hwnd, &ps);
+            if (g_dx_ui) {
+                g_dx_ui->Render();
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            HDC dc = ps.hdc;
             RECT rc = {};
             GetClientRect(hwnd, &rc);
             DrawBackground(dc, rc);
@@ -4476,7 +5331,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 RECT status_rect = {};
                 GetWindowRect(g_status, &status_rect);
                 MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&status_rect), 2);
-                InvalidateRect(hwnd, &status_rect, TRUE);
+                InvalidateRect(hwnd, &status_rect, g_dx_ui ? FALSE : TRUE);
                 UpdateWindow(hwnd);
             }
             return 0;
@@ -4497,10 +5352,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 return 0;
             }
             std::wstring saved_key = g_cached_key;
+            std::wstring display_key = FormatKeyDisplay(saved_key);
             SetStage(UiStage::Connecting);
             SetStatus(hwnd, L"Validating saved key...");
             g_ignore_key_change = true;
-            SetWindowTextW(g_edit, saved_key.c_str());
+            SetWindowTextW(g_edit, display_key.c_str());
             g_ignore_key_change = false;
             EnableButton(false);
             WorkerArgs* args = new WorkerArgs{ hwnd, TaskType::Validate, saved_key, {}, true };
@@ -4510,16 +5366,39 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         case WM_TIMER: {
             if (wparam == kUiTimerId) {
                 if (g_fade_active) {
-                    BYTE next_alpha = static_cast<BYTE>(std::min<int>(255, g_fade_alpha + kFadeStep));
+                    BYTE next_alpha = static_cast<BYTE>((std::min<int>)(255, static_cast<int>(g_fade_alpha) + kFadeStep));
                     g_fade_alpha = next_alpha;
                     SetLayeredWindowAttributes(hwnd, 0, g_fade_alpha, LWA_ALPHA);
                     if (g_fade_alpha >= 255) {
                         g_fade_active = false;
                     }
                 }
-                bool animate_status = (g_stage == UiStage::Connecting || g_stage == UiStage::Loading);
+                if (g_dx_ui && (g_stage == UiStage::Connecting || g_stage == UiStage::Loading || g_stage == UiStage::Dashboard ||
+                                (g_stage == UiStage::Login && g_mouse_in_window))) {
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                if (g_dx_ui && g_stage == UiStage::Login && g_mouse_in_window && g_button) {
+                    InvalidateRect(g_button, nullptr, g_dx_ui ? FALSE : TRUE);
+                }
+                if (g_dx_ui && g_button && (g_stage == UiStage::Loading || g_stage == UiStage::Dashboard)) {
+                    bool show_spinner = (g_stage == UiStage::Loading);
+                    if (!show_spinner) {
+                        std::wstring status_snapshot;
+                        EnterCriticalSection(&g_status_lock);
+                        status_snapshot = g_status_text;
+                        LeaveCriticalSection(&g_status_lock);
+                        std::wstring status_lower = ToLowerString(status_snapshot);
+                        show_spinner = (status_lower.find(L"waiting") != std::wstring::npos);
+                    }
+                    if (show_spinner) {
+                        InvalidateRect(g_button, nullptr, g_dx_ui ? FALSE : TRUE);
+                    }
+                }
+                bool animate_status = (g_stage == UiStage::Connecting || (g_stage == UiStage::Loading && !g_dx_ui));
                 if (animate_status && !g_status_base.empty()) {
-                    int dots = g_status_anim_tick++ % 4;
+                    ULONGLONG now = GetTickCount64();
+                    int dots = static_cast<int>((now / 320ULL) % 4ULL);
+                    g_status_anim_tick = dots;
                     std::wstring animated = g_status_base + std::wstring(dots, L'.');
                     EnterCriticalSection(&g_status_lock);
                     g_status_text = animated;
@@ -4532,12 +5411,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                         InvalidateRect(g_status_hwnd, nullptr, TRUE);
                         UpdateWindow(g_status_hwnd);
                     }
+                    if (g_dx_ui) {
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
                 }
             }
             return 0;
         }
         case WM_DESTROY:
             KillTimer(hwnd, kUiTimerId);
+            if (g_dx_ui) {
+                g_dx_ui->Shutdown();
+                g_dx_ui.reset();
+            }
             DestroyFonts();
             StopGdiPlus();
             if (g_avatar_list) {
