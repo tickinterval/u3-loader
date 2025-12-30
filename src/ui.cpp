@@ -4046,6 +4046,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     SetStatus(hwnd, download_status);
     
     std::vector<char> dll_bytes;
+
     std::wstring dll_url_wide = Utf8ToWide(dll_url_utf8);
     if (!HttpGetBinary(dll_url_wide, &dll_bytes, &error)) {
         log_event("download_fail", WideToUtf8(error));
@@ -4053,33 +4054,18 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     }
 
     if (has_encryption) {
-        if (dll_key_b64.empty() || dll_iv_b64.empty()) {
-            log_event("download_fail", "missing_payload_key");
-            return fail_dashboard(L"An unknown error occured: D1000029/D1000029"); // Missing payload key
-        }
-        if (!dll_alg.empty() && dll_alg != "aes-256-cbc") {
-            log_event("download_fail", "unsupported_payload_alg");
-            return fail_dashboard(L"An unknown error occured: D1000030/D1000030"); // Unsupported payload cipher
-        }
-        std::vector<BYTE> key_bytes;
-        std::vector<BYTE> iv_bytes;
-        if (!Base64Decode(dll_key_b64, &key_bytes) || !Base64Decode(dll_iv_b64, &iv_bytes)) {
-            log_event("download_fail", "invalid_payload_key");
-            return fail_dashboard(L"An unknown error occured: D1000031/D1000031"); // Invalid payload key
-        }
+        std::vector<BYTE> key_bytes, iv_bytes;
+        Base64Decode(dll_key_b64, &key_bytes);
+        Base64Decode(dll_iv_b64, &iv_bytes);
+        
         std::vector<char> decrypted;
         std::wstring decrypt_error;
+
         if (!DecryptAes256Cbc(dll_bytes, key_bytes, iv_bytes, &decrypted, &decrypt_error)) {
-            log_event("download_fail", "decrypt_failed");
-            return fail_dashboard(L"An unknown error occured: D1000032/D1000032"); // Payload decrypt failed
+             log_event("decrypt_fail", WideToUtf8(decrypt_error));
+             return fail_dashboard(L"An unknown error occured: D1000032/D1000032"); //Payload decrypt failed
         }
-        if (!key_bytes.empty()) {
-            SecureZeroMemory(key_bytes.data(), key_bytes.size());
-        }
-        if (!iv_bytes.empty()) {
-            SecureZeroMemory(iv_bytes.data(), iv_bytes.size());
-        }
-        dll_bytes.swap(decrypted);
+        dll_bytes = decrypted;
     }
 
     SetStatus(hwnd, L"Verifying build...");
@@ -4089,6 +4075,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     }
     std::wstring expected_hash = ToLowerString(Utf8ToWide(dll_sha256));
     std::wstring actual_hash = ToLowerString(Utf8ToWide(Sha256HexBytes(dll_bytes)));
+    
     if (expected_hash != actual_hash) {
         log_event("verify_fail", "hash_mismatch");
         return fail_dashboard(L"An unknown error occured: D00BAD01/D00BAD01"); //Build hash mismatch
@@ -4146,7 +4133,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     }
 
     SetStatus(hwnd, L"Initialization");
-    Sleep(2000);
+    Sleep(5000);
     
     // Закрываем shared memory (DLL уже прочитала данные)
     shared_config::CleanupConfig(sharedHandle);

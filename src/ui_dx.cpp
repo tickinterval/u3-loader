@@ -378,7 +378,7 @@ std::wstring DeriveModeFromStatus(const std::wstring& status) {
 
 std::wstring DerivePhaseFromStatus(const std::wstring& status) {
     if (ContainsInsensitive(status, L"waiting")) {
-        return L"ready";
+        return L"sync";
     }
     if (ContainsInsensitive(status, L"validating") ||
         ContainsInsensitive(status, L"license") ||
@@ -392,6 +392,9 @@ std::wstring DerivePhaseFromStatus(const std::wstring& status) {
         ContainsInsensitive(status, L"prepar") ||
         ContainsInsensitive(status, L"download")) {
         return L"sync";
+    }
+    if (ContainsInsensitive(status, L"initialization")) {
+        return L"ready";
     }
     if (ContainsInsensitive(status, L"verify") ||
         ContainsInsensitive(status, L"load") ||
@@ -417,10 +420,7 @@ std::wstring FormatUptimeValue(ULONGLONG seconds) {
 }
 
 float ProgressForModePhase(const std::wstring& mode, const std::wstring& phase) {
-    if (mode == L"WAITING") {
-        return 100.0f;
-    }
-    if (mode == L"RUNNING") {
+    if (mode == L"WAITING" || mode == L"RUNNING") {
         if (phase == L"auth") {
             return 25.0f;
         }
@@ -431,7 +431,7 @@ float ProgressForModePhase(const std::wstring& mode, const std::wstring& phase) 
             return 80.0f;
         }
         if (phase == L"ready") {
-            return 95.0f;
+            return 100.0f;
         }
         return 15.0f;
     }

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <string>
+#include <cstdint>
 
 namespace loader {
 namespace shared_config {
@@ -36,19 +37,35 @@ struct SharedConfig {
 #define CONFIG_FLAG_HEARTBEAT_ENABLED   0x0001
 #define CONFIG_FLAG_PROTECTION_ENABLED  0x0002
 
-// Генерация уникального имени shared memory
-inline std::wstring GenerateSharedName() {
+// Генерация уникального обфусцированного имени
+inline std::wstring ObfuscateName(DWORD pid) {
+    // Секретная соль (меняйте для каждого билда проекта)
+    const uint32_t SALT = 0x9E3779B9; 
+    
+    // Простой FNV-1a хеш для обфускации
+    uint32_t hash = 0x811C9DC5;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&pid);
+    for (int i = 0; i < 4; i++) {
+        hash ^= p[i];
+        hash *= 0x01000193;
+    }
+    hash ^= SALT;
+    hash *= 0x01000193;
+
     wchar_t name[64];
-    // Используем PID целевого процесса как часть имени
-    swprintf_s(name, L"%s%08X", SHARED_CONFIG_NAME_PREFIX, GetCurrentProcessId());
+    // Используем Local\ + HEX-хеш (без префиксов U3W)
+    swprintf_s(name, L"Local\\S_%08X%08X", hash, hash ^ 0xABCDEF01);
     return name;
+}
+
+// Генерация имени для текущего процесса
+inline std::wstring GenerateSharedName() {
+    return ObfuscateName(GetCurrentProcessId());
 }
 
 // Генерация имени для целевого процесса
 inline std::wstring GenerateSharedNameForProcess(DWORD targetPid) {
-    wchar_t name[64];
-    swprintf_s(name, L"%s%08X", SHARED_CONFIG_NAME_PREFIX, targetPid);
-    return name;
+    return ObfuscateName(targetPid);
 }
 
 // Запись конфигурации в shared memory (вызывается лоадером)
@@ -96,13 +113,14 @@ inline bool ReadConfig(SharedConfig* config) {
     
     std::wstring name = GenerateSharedNameForProcess(currentPid);
     
-    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
+    // ОТКРЫВАЕМ С ПРАВАМИ ЗАПИСИ ЧТОБЫ ЗАТЕРЕТЬ (WRITE_ACCESS)
+    HANDLE mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name.c_str());
     if (!mapping) {
         return false;
     }
     
     SharedConfig* shared = reinterpret_cast<SharedConfig*>(
-        MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(SharedConfig))
+        MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedConfig))
     );
     
     if (!shared) {

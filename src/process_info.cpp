@@ -17,6 +17,8 @@ uint32_t GetCPUID() {
     
     // Используем комбинацию EAX, EBX, ECX, EDX для создания уникального идентификатора
     // XOR всех регистров для получения 32-битного значения
+    // Mask APIC ID bits (per-core) for a stable fingerprint.
+    cpuInfo[1] &= 0x00FFFFFF;
     return static_cast<uint32_t>(cpuInfo[0] ^ cpuInfo[1] ^ cpuInfo[2] ^ cpuInfo[3]);
 }
 

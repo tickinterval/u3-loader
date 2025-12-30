@@ -231,18 +231,25 @@ DWORD __stdcall LoaderShellcode32(LoaderData32* loader_data) {
                 }
                 
                 while (thunk->u1.AddressOfData) {
+                    FARPROC func = nullptr;
                     if (IMAGE_SNAP_BY_ORDINAL(thunk->u1.Ordinal)) {
-                        FARPROC func = loader_data->fn_GetProcAddress(module, 
+                        func = loader_data->fn_GetProcAddress(module, 
                             reinterpret_cast<LPCSTR>(IMAGE_ORDINAL(thunk->u1.Ordinal)));
-                        func_ref->u1.Function = reinterpret_cast<DWORD_PTR>(func);
                     } else {
                         PIMAGE_IMPORT_BY_NAME import_name = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(base + thunk->u1.AddressOfData);
-                        FARPROC func = loader_data->fn_GetProcAddress(module, import_name->Name);
-                        func_ref->u1.Function = reinterpret_cast<DWORD_PTR>(func);
+                        func = loader_data->fn_GetProcAddress(module, import_name->Name);
                     }
+                    
+                    if (!func) {
+                        return 0; // Ошибка разрешения импорта
+                    }
+                    
+                    func_ref->u1.Function = reinterpret_cast<DWORD_PTR>(func);
                     thunk++;
                     func_ref++;
                 }
+            } else {
+                return 0; // Ошибка загрузки библиотеки
             }
             import_desc++;
         }
