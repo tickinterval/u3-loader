@@ -280,6 +280,9 @@ bool LoadConfig(Config* config) {
     config->expected_thumbprint = NormalizeThumbprint(kDefaultExpectedThumbprint);
     config->user_agent = kDefaultUserAgent;
     config->target_process = kDefaultTargetProcess;
+    if (config->expected_thumbprint.empty()) {
+        return false;
+    }
     return true;
 }
 
@@ -1145,6 +1148,12 @@ bool TlsHandshake(SOCKET sock,
     if (!out) {
         return false;
     }
+    if (expected_thumbprint.empty()) {
+        if (error) {
+            *error = L"Missing TLS thumbprint";
+        }
+        return false;
+    }
 
     bool manual_validation = !expected_thumbprint.empty();
     SCHANNEL_CRED cred = {};
@@ -1546,22 +1555,21 @@ bool ParseTcpUrl(const std::wstring& url, TcpUrlParts* out, std::wstring* error)
     }
     std::wstring input = url;
     size_t scheme_pos = input.find(L"://");
-    size_t start = 0;
-    bool use_tls = false;
-    if (scheme_pos != std::wstring::npos) {
-        std::wstring scheme = ToLowerString(input.substr(0, scheme_pos));
-        if (scheme == L"tcp") {
-            use_tls = false;
-        } else if (scheme == L"tcps" || scheme == L"tls") {
-            use_tls = true;
-        } else {
-            if (error) {
-                *error = L"Unsupported URL scheme";
-            }
-            return false;
+    if (scheme_pos == std::wstring::npos) {
+        if (error) {
+            *error = L"TLS required";
         }
-        start = scheme_pos + 3;
+        return false;
     }
+    std::wstring scheme = ToLowerString(input.substr(0, scheme_pos));
+    if (scheme != L"tcps" && scheme != L"tls") {
+        if (error) {
+            *error = L"TLS required";
+        }
+        return false;
+    }
+    size_t start = scheme_pos + 3;
+    bool use_tls = true;
 
     size_t path_pos = input.find(L'/', start);
     std::wstring hostport = path_pos == std::wstring::npos ? input.substr(start) : input.substr(start, path_pos - start);
@@ -2623,6 +2631,34 @@ std::wstring FormatUpdatedLabel(const std::wstring& iso) {
     return date;
 }
 
+static bool IsLifetimeSeconds(ULONGLONG diff_seconds) {
+    const ULONGLONG kLifetimeSeconds = 60ULL * 60 * 24 * 365 * 2;
+    return diff_seconds >= kLifetimeSeconds;
+}
+
+bool IsLifetimeSubscription(const std::wstring& iso) {
+    FILETIME expiry = {};
+    if (!ParseIso8601Utc(iso, &expiry)) {
+        return false;
+    }
+    FILETIME now = {};
+    GetSystemTimeAsFileTime(&now);
+
+    ULARGE_INTEGER now_val = {};
+    ULARGE_INTEGER expiry_val = {};
+    now_val.LowPart = now.dwLowDateTime;
+    now_val.HighPart = now.dwHighDateTime;
+    expiry_val.LowPart = expiry.dwLowDateTime;
+    expiry_val.HighPart = expiry.dwHighDateTime;
+
+    if (expiry_val.QuadPart <= now_val.QuadPart) {
+        return false;
+    }
+
+    ULONGLONG diff_seconds = (expiry_val.QuadPart - now_val.QuadPart) / 10000000ULL;
+    return IsLifetimeSeconds(diff_seconds);
+}
+
 std::wstring FormatExpiryLabel(const std::wstring& iso) {
     FILETIME expiry = {};
     if (!ParseIso8601Utc(iso, &expiry)) {
@@ -2643,6 +2679,9 @@ std::wstring FormatExpiryLabel(const std::wstring& iso) {
     }
 
     ULONGLONG diff_seconds = (expiry_val.QuadPart - now_val.QuadPart) / 10000000ULL;
+    if (IsLifetimeSeconds(diff_seconds)) {
+        return L"Lifetime";
+    }
     if (diff_seconds <= 3600) {
         int minutes = static_cast<int>((diff_seconds + 59) / 60);
         wchar_t buffer[64] = {};
@@ -3252,9 +3291,14 @@ COLORREF BlendColor(COLORREF base, COLORREF overlay, float alpha) {
                blend(GetBValue(base), GetBValue(overlay)));
 }
 
+bool IsInjectableStatus(const std::wstring& status) {
+    std::wstring s = ToLowerString(status);
+    return (s == L"safe" || s == L"risky");
+}
+
 COLORREF GetStatusColor(const std::wstring& status) {
     std::wstring s = ToLowerString(status);
-    if (s.find(L"ready") != std::wstring::npos) {
+    if (s.find(L"ready") != std::wstring::npos || s.find(L"safe") != std::wstring::npos) {
         return RGB(88, 220, 148);
     }
     if (s.find(L"risky") != std::wstring::npos || s.find(L"risk") != std::wstring::npos) {
@@ -3263,7 +3307,9 @@ COLORREF GetStatusColor(const std::wstring& status) {
     if (s.find(L"updat") != std::wstring::npos) {
         return RGB(244, 210, 90);
     }
-    if (s.find(L"off") != std::wstring::npos || s.find(L"down") != std::wstring::npos) {
+    if (s.find(L"off") != std::wstring::npos ||
+        s.find(L"down") != std::wstring::npos ||
+        s.find(L"disable") != std::wstring::npos) {
         return RGB(240, 92, 92);
     }
     return kSurfaceBorder;
@@ -3591,7 +3637,7 @@ void SetStage(UiStage stage) {
     ShowWindow(g_label_col_updated, SW_HIDE);
     ShowWindow(g_label_col_expires, SW_HIDE);
     ShowWindow(g_list, (dashboard && !g_dx_ui) ? SW_SHOW : SW_HIDE);
-    bool show_button = (login || (!g_dx_ui && dashboard_like));
+    bool show_button = (!g_dx_ui && (login || dashboard_like));
     ShowWindow(g_button, show_button ? SW_SHOW : SW_HIDE);
     if (g_button && !show_button) {
         SendMessageW(g_button, BM_SETSTATE, FALSE, 0);
@@ -3952,10 +3998,10 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     // Сначала пытаемся получить ok
     JsonGetBoolTopLevel(response, "ok", &ok);
     
-    if (!ok) {
-        std::string error_msg;
-        JsonGetStringTopLevel(response, "error", &error_msg);
-        log_event("request_dll_fail", error_msg.empty() ? "invalid_response" : error_msg);
+        if (!ok) {
+            std::string error_msg;
+            JsonGetStringTopLevel(response, "error", &error_msg);
+            log_event("request_dll_fail", error_msg.empty() ? "invalid_response" : error_msg);
         
         // Показываем более информативное сообщение об ошибке
         if (error_msg == "invalid_token") {
@@ -3974,6 +4020,8 @@ DWORD WINAPI WorkerThread(LPVOID param) {
             return fail_dashboard(L"An unknown error occured: D1000026/D1000026"); // Protection failed
         } else if (error_msg == "build_failed") {
             return fail_dashboard(L"An unknown error occured: D1000027/D1000027"); // Build failed
+        } else if (error_msg == "status_blocked") {
+            return fail_dashboard(L"An unknown error occured: D1000034/D1000034"); // Product status blocked
         }
         
         return fail_dashboard(L"An unknown error occured: D1000016/D1000016"); // Invalid server response
@@ -4055,16 +4103,6 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     sharedCfg.version = 2;
     wcscpy_s(sharedCfg.server_url, g_config.server_url.c_str());
     wcscpy_s(sharedCfg.server_thumbprint, g_config.expected_thumbprint.c_str());
-    wcscpy_s(sharedCfg.license_key, g_cached_key.c_str());
-    
-    // HWID в wide string
-    std::wstring hwid_wide = Utf8ToWide(hwid_event);
-    
-    if (hwid_wide.length() >= 128) {
-        hwid_wide = hwid_wide.substr(0, 127);
-    }
-    
-    wcscpy_s(sharedCfg.hwid, hwid_wide.c_str());
     
     if (program.code.length() >= 32) {
         return fail_dashboard(L"An unknown error occured: D1000010/D1000010"); // Product code too long
@@ -4222,7 +4260,7 @@ void LayoutControls(HWND hwnd) {
         inner_y += label_height + spacing;
 
         int field_padding_x = Scale(12);
-        int field_padding_y = (std::max)(0, (field_height - edit_height) / 2);
+        int field_padding_y = (std::max)(0, (field_height - edit_height) / 2 + Scale(5));
         g_field_key = {inner_x, inner_y, inner_x + inner_width, inner_y + field_height};
         MoveWindow(g_edit, inner_x + field_padding_x, inner_y + field_padding_y,
                    inner_width - field_padding_x * 2, edit_height, TRUE);
@@ -4230,7 +4268,7 @@ void LayoutControls(HWND hwnd) {
 
         MoveWindow(g_button, inner_x, inner_y, inner_width, button_height, TRUE);
         SetButtonRoundedRegion(g_button, use_dx);
-        inner_y += button_height + spacing;
+        inner_y += button_height + Scale(14);
 
         MoveWindow(g_status, inner_x, inner_y, inner_width, status_height, TRUE);
 
@@ -4346,7 +4384,7 @@ void LayoutControls(HWND hwnd) {
             int button_y = right_header_y + header_height + Scale(12);
             MoveWindow(g_button, right_inner_x, button_y, right_inner_width, button_height, TRUE);
             SetButtonRoundedRegion(g_button, use_dx);
-            int status_y = button_y + button_height + Scale(12);
+            int status_y = button_y + button_height + Scale(16);
             MoveWindow(g_status, right_inner_x, status_y, right_inner_width, status_height, TRUE);
 
             ShowWindow(g_label_programs, SW_HIDE);
@@ -4843,6 +4881,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 ProgramInfo program = g_programs[static_cast<size_t>(selected)];
                 LeaveCriticalSection(&g_programs_lock);
 
+                if (!IsInjectableStatus(program.status)) {
+                    std::wstring message = L"An unknown error occured: D1000033/D1000033"; // Build not injectable
+                    SetStatus(hwnd, message);
+                    ShowErrorBox(hwnd, message);
+                    return 0;
+                }
+
                 SetStage(UiStage::Loading);
                 SetStatus(hwnd, L"Preparing build");
                 EnableButton(false);
@@ -4864,7 +4909,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 InvalidateRect(hwnd, &g_btn_min, TRUE);
                 return 0;
             }
-            if (g_dx_ui && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading)) {
+            if (g_dx_ui && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading || g_stage == UiStage::Login)) {
                 if (g_button && IsWindowEnabled(g_button)) {
                     RECT button_rect = {};
                     if (GetWindowRect(g_button, &button_rect)) {
@@ -4915,7 +4960,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                     SendMessageW(g_button, BM_SETSTATE, FALSE, 0);
                 }
                 ReleaseCapture();
-                if (g_dx_ui && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading) &&
+                if (g_dx_ui && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading || g_stage == UiStage::Login) &&
                     g_button && IsWindowEnabled(g_button)) {
                     POINT pt = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
                     RECT button_rect = {};
@@ -5023,6 +5068,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                     if (max_scroll > 0) {
                         int step = GET_WHEEL_DELTA_WPARAM(wparam) / WHEEL_DELTA;
                         if (step != 0) {
+                            g_keyboard_nav_active = false;
                             int next = g_products_scroll - step;
                             next = (std::max)(0, (std::min)(next, max_scroll));
                             if (next != g_products_scroll) {
@@ -5075,7 +5121,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         case WM_DRAWITEM: {
             auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
             if (dis->CtlID == kControlIdButton) {
-                if (g_dx_ui && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading)) {
+                if (g_dx_ui && (g_stage == UiStage::Dashboard || g_stage == UiStage::Loading || g_stage == UiStage::Login)) {
                     return TRUE;
                 }
                 HDC dc = dis->hDC;

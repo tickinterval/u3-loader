@@ -23,7 +23,7 @@ const COLORREF kMaskColor = RGB(255, 0, 255);
 
 const char kLoaderVersion[] = "1.2.2";
 const wchar_t kDefaultServerUrl[] = L"tcps://tcp.u3.llvm.uk:4000";
-const wchar_t kDefaultExpectedThumbprint[] = L""; // Set to TLS cert thumbprint (hex) for pinning.
+const wchar_t kDefaultExpectedThumbprint[] = L"0219BB3E2098384C323E494FA285FC594993951A6822852764B163CBA7F273D2"; // Set to TLS cert thumbprint (hex) for pinning.
 const wchar_t kDefaultUserAgent[] = L"u3ware/1.0";
 const wchar_t kDefaultTargetProcess[] = L"wotblitz.exe";
 

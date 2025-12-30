@@ -3,6 +3,7 @@
 #include <wincrypt.h>
 #include <vector>
 #include <cstring>
+#include <limits>
 
 // Определения для совместимости
 #ifndef IMAGE_SNAP_BY_ORDINAL
@@ -395,6 +396,7 @@ static InjectionResult InjectDllInternal(DWORD target_pid, const std::vector<cha
 
     // Сохраняем важные данные до шифрования
     DWORD image_size = nt_headers->OptionalHeader.SizeOfImage;
+    DWORD image_size_no_overlay = image_size;
     DWORD headers_size = nt_headers->OptionalHeader.SizeOfHeaders;
     WORD num_sections = nt_headers->FileHeader.NumberOfSections;
     DWORD e_lfanew = dos_header->e_lfanew;
@@ -418,6 +420,25 @@ static InjectionResult InjectDllInternal(DWORD target_pid, const std::vector<cha
         sections_info[i].PointerToRawData = section[i].PointerToRawData;
         sections_info[i].Characteristics = section[i].Characteristics;
         sections_info[i].VirtualSize = section[i].Misc.VirtualSize;
+    }
+
+    size_t overlay_offset = headers_size;
+    for (WORD i = 0; i < num_sections; i++) {
+        size_t end = static_cast<size_t>(sections_info[i].PointerToRawData) +
+            static_cast<size_t>(sections_info[i].SizeOfRawData);
+        if (end > overlay_offset) {
+            overlay_offset = end;
+        }
+    }
+
+    size_t overlay_size = 0;
+    if (dll_bytes.size() > overlay_offset) {
+        overlay_size = dll_bytes.size() - overlay_offset;
+        if (overlay_size > (static_cast<size_t>((std::numeric_limits<DWORD>::max)()) - image_size_no_overlay)) {
+            result.error = L"DLL overlay is too large";
+            return result;
+        }
+        image_size = image_size_no_overlay + static_cast<DWORD>(overlay_size);
     }
 
     // Шифруем DLL в памяти
@@ -455,6 +476,10 @@ static InjectionResult InjectDllInternal(DWORD target_pid, const std::vector<cha
     
     // Копирование заголовков
     memcpy(local_image.data(), dll_bytes.data(), headers_size);
+    if (overlay_size > 0) {
+        PIMAGE_NT_HEADERS local_nt_headers = reinterpret_cast<PIMAGE_NT_HEADERS>(local_image.data() + e_lfanew);
+        local_nt_headers->OptionalHeader.SizeOfImage = image_size;
+    }
 
     // Копирование секций
     for (WORD i = 0; i < num_sections; i++) {
@@ -463,6 +488,12 @@ static InjectionResult InjectDllInternal(DWORD target_pid, const std::vector<cha
                 dll_bytes.data() + sections_info[i].PointerToRawData,
                 sections_info[i].SizeOfRawData);
         }
+    }
+
+    if (overlay_size > 0) {
+        memcpy(local_image.data() + image_size_no_overlay,
+            dll_bytes.data() + overlay_offset,
+            overlay_size);
     }
 
     // Затираем оригинальные байты DLL

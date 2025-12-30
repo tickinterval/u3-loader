@@ -27,6 +27,8 @@ namespace loader {
 
 using Microsoft::WRL::ComPtr;
 
+bool IsLifetimeSubscription(const std::wstring& iso);
+
 namespace {
 
 struct Theme {
@@ -240,6 +242,9 @@ std::wstring BuildSubscriptionLabel() {
     LeaveCriticalSection(&g_programs_lock);
     if (expires.empty()) {
         return expires;
+    }
+    if (IsLifetimeSubscription(expires)) {
+        return L"Lifetime";
     }
     expires = NormalizeSubscriptionDate(expires);
     if (!expires.empty() && expires.front() != L'[') {
@@ -556,6 +561,8 @@ private:
     float telemetry_progress_ = 0.0f;
     float telemetry_progress_target_ = 0.0f;
     ULONGLONG telemetry_progress_tick_ = 0;
+    float telemetry_scan_ = 0.0f;
+    ULONGLONG telemetry_scan_tick_ = 0;
     bool com_initialized_ = false;
 };
 
@@ -1006,6 +1013,8 @@ void DxUiRendererImpl::DiscardDeviceResources() {
     telemetry_progress_ = 0.0f;
     telemetry_progress_target_ = 0.0f;
     telemetry_progress_tick_ = 0;
+    telemetry_scan_ = 0.0f;
+    telemetry_scan_tick_ = 0;
 }
 
 void DxUiRendererImpl::DrawBackground() {
@@ -1226,6 +1235,7 @@ void DxUiRendererImpl::DrawStageContent() {
                 }
             }
         }
+        DrawActionButton();
         return;
     }
 
@@ -1577,7 +1587,7 @@ void DxUiRendererImpl::DrawProductsList() {
     }
 
     int start = g_products_scroll;
-    if (g_selected_index >= 0) {
+    if (g_selected_index >= 0 && g_keyboard_nav_active) {
         if (g_selected_index < start) {
             start = g_selected_index;
         } else if (g_selected_index >= start + visible) {
@@ -1815,6 +1825,15 @@ void DxUiRendererImpl::DrawDashboardContent() {
     if (std::fabs(telemetry_progress_ - telemetry_progress_target_) < 0.15f) {
         telemetry_progress_ = telemetry_progress_target_;
     }
+    if (telemetry_scan_tick_ == 0) {
+        telemetry_scan_tick_ = progress_now;
+    }
+    float scan_period = (mode == L"WAITING") ? 3.0f : 2.2f;
+    telemetry_scan_ += dt / scan_period;
+    if (telemetry_scan_ >= 1.0f) {
+        telemetry_scan_ -= std::floor(telemetry_scan_);
+    }
+    telemetry_scan_tick_ = progress_now;
 
     DrawCardMeta(g_card_programs, L"state: " + mode);
     if (!IsRectEmpty(&g_card_telemetry)) {
@@ -1916,8 +1935,7 @@ void DxUiRendererImpl::DrawDashboardContent() {
         }
     }
 
-    ULONGLONG now = GetTickCount64();
-    float scan_t = static_cast<float>((now % 1200ULL) / 1200.0);
+    float scan_t = telemetry_scan_;
     float scan_width = 40.0f;
     float scan_x = bar.left + scan_t * ((bar.right - bar.left) + scan_width) - scan_width;
     D2D1_RECT_F scan = D2D1::RectF(scan_x, bar.top, scan_x + scan_width, bar.bottom);
@@ -1940,7 +1958,8 @@ void DxUiRendererImpl::DrawDashboardContent() {
             clipped = true;
         }
         scan_brush->SetOpacity(scan_opacity);
-        render_target_->FillRectangle(scan, scan_brush);
+        float scan_radius = (std::min)(bar_height * 0.5f, (scan.right - scan.left) * 0.5f);
+        render_target_->FillRoundedRectangle(D2D1::RoundedRect(scan, scan_radius, scan_radius), scan_brush);
         scan_brush->SetOpacity(1.0f);
         if (clipped) {
             render_target_->PopLayer();
@@ -2342,7 +2361,7 @@ void DxUiRendererImpl::DrawActionButton() {
     if (!render_target_ || !g_button) {
         return;
     }
-    if (g_stage != UiStage::Dashboard && g_stage != UiStage::Loading) {
+    if (g_stage != UiStage::Dashboard && g_stage != UiStage::Loading && g_stage != UiStage::Login) {
         return;
     }
 
