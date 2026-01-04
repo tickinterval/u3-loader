@@ -55,6 +55,8 @@ bool HttpGetBinary(const std::wstring& url, std::vector<char>* out, std::wstring
 bool WriteFileBinary(const std::wstring& path, const std::vector<char>& data);
 std::string Sha256HexBytes(const std::vector<char>& data);
 std::wstring SanitizeToken(const std::wstring& value);
+void ShowErrorBox(HWND hwnd, const std::wstring& message);
+void ShowInfoBox(HWND hwnd, const std::wstring& message);
 
 static std::unordered_map<std::wstring, int> g_avatar_index;
 static std::vector<HBITMAP> g_avatar_bitmaps;
@@ -1945,6 +1947,98 @@ void SendEvent(const std::wstring& server_url,
     HttpRequest(L"POST", server_url + L"/event", body, &response, &error);
 }
 
+bool TryRequestHwidReset(HWND hwnd, const std::wstring& key, const std::string& hwid) {
+    if (key.empty() || hwid.empty()) {
+        return false;
+    }
+
+    std::string key_utf8 = WideToUtf8(key);
+    std::string preflight = "{\"key\":\"" + JsonEscape(key_utf8) +
+        "\",\"hwid\":\"" + JsonEscape(hwid) + "\",\"check_only\":true}";
+
+    std::string preflight_response;
+    std::wstring preflight_error;
+    if (HttpRequest(L"POST", g_config.server_url + L"/hwid-reset", preflight, &preflight_response, &preflight_error)) {
+        bool ok = false;
+        JsonGetBoolTopLevel(preflight_response, "ok", &ok);
+        if (ok) {
+            std::string status;
+            JsonGetStringTopLevel(preflight_response, "status", &status);
+            if (status == "pending_existing") {
+                std::wstring wait = L"HWID reset request already submitted. Please wait 24-48 hours for review.";
+                SetStatus(hwnd, wait);
+                ShowInfoBox(hwnd, wait);
+                return true;
+            }
+            if (status == "already_current") {
+                std::wstring message = L"Current device already matches HWID.";
+                SetStatus(hwnd, message);
+                ShowInfoBox(hwnd, message);
+                return true;
+            }
+        }
+    }
+
+    const wchar_t* prompt =
+        L"Device mismatch detected.\n\n"
+        L"Reset HWID to this device? This will move the license to this device.";
+    if (MessageBoxW(hwnd, prompt, L"u3ware", MB_ICONWARNING | MB_YESNO) != IDYES) {
+        return false;
+    }
+
+    SetStatus(hwnd, L"Submitting HWID reset...");
+
+    std::string body = "{\"key\":\"" + JsonEscape(key_utf8) +
+        "\",\"hwid\":\"" + JsonEscape(hwid) + "\"";
+    AppendDeviceInfoFields(&body);
+    body += "}";
+
+    std::string response;
+    std::wstring error;
+    if (!HttpRequest(L"POST", g_config.server_url + L"/hwid-reset", body, &response, &error)) {
+        std::wstring message = L"HWID reset request failed.";
+        if (!error.empty()) {
+            message += L"\n";
+            message += error;
+        }
+        ShowErrorBox(hwnd, message);
+        SetStatus(hwnd, L"HWID reset failed");
+        return true;
+    }
+
+    bool ok = false;
+    JsonGetBoolTopLevel(response, "ok", &ok);
+    if (!ok) {
+        std::string error_code;
+        JsonGetStringTopLevel(response, "error", &error_code);
+        std::wstring message = L"HWID reset request rejected.";
+        if (!error_code.empty()) {
+            message += L"\nReason: ";
+            message += Utf8ToWide(error_code);
+        }
+        ShowErrorBox(hwnd, message);
+        SetStatus(hwnd, L"HWID reset failed");
+        return true;
+    }
+
+    EnterCriticalSection(&g_status_lock);
+    g_last_error_code.clear();
+    LeaveCriticalSection(&g_status_lock);
+    std::string status;
+    JsonGetStringTopLevel(response, "status", &status);
+    std::wstring success;
+    if (status == "already_current") {
+        success = L"Current device already matches HWID.";
+    } else if (status == "pending_existing") {
+        success = L"HWID reset request already submitted. Please wait 24-48 hours for review.";
+    } else {
+        success = L"HWID reset request sent. Please wait 24-48 hours for review.";
+    }
+    SetStatus(hwnd, success);
+    ShowInfoBox(hwnd, success);
+    return true;
+}
+
 bool JsonGetBool(const std::string& json, const std::string& key, bool* value) {
     std::string needle = "\"" + key + "\"";
     size_t pos = json.find(needle);
@@ -3723,6 +3817,11 @@ void ShowErrorBox(HWND hwnd, const std::wstring& message) {
     MessageBoxW(owner, message.c_str(), L"u3ware", MB_OK | MB_ICONERROR);
 }
 
+void ShowInfoBox(HWND hwnd, const std::wstring& message) {
+    HWND owner = g_status_hwnd ? g_status_hwnd : hwnd;
+    MessageBoxW(owner, message.c_str(), L"u3ware", MB_OK | MB_ICONINFORMATION);
+}
+
 void EnableButton(bool enabled) {
     if (g_button) {
         EnableWindow(g_button, enabled ? TRUE : FALSE);
@@ -3866,6 +3965,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
             bool clear_saved_key = true;
             if (!error_code.empty()) {
                 std::wstring message;
+                bool handled = false;
                 if (error_code == "missing_key_or_hwid") {
                     if (is_auto && validate_attempts < 2) {
                         Sleep(700);
@@ -3880,7 +3980,11 @@ DWORD WINAPI WorkerThread(LPVOID param) {
                 } else if (error_code == "expired") {
                     message = L"An unknown error occured: D2000011/D2000013"; // Subscription expired
                 } else if (error_code == "hwid_mismatch") {
-                    message = L"An unknown error occured: D1000015/D1000015"; // Device mismatch
+                    clear_saved_key = false;
+                    handled = TryRequestHwidReset(hwnd, key, hwid);
+                    if (!handled) {
+                        message = L"An unknown error occured: D1000015/D1000015"; // Device mismatch
+                    }
                 } else if (error_code == "no_products") {
                     message = L"An unknown error occured: D1000016/D1000016"; // No programs on this key
                 } else if (error_code == "device_limit") {
@@ -3888,8 +3992,10 @@ DWORD WINAPI WorkerThread(LPVOID param) {
                 } else {
                     message = L"An unknown error occured: D1000019/D1000019"; // Unknown server error
                 }
-                SetStatus(hwnd, message);
-                ShowErrorBox(hwnd, message);
+                if (!handled) {
+                    SetStatus(hwnd, message);
+                    ShowErrorBox(hwnd, message);
+                }
             } else {
                 std::wstring message = L"An unknown error occured: D1000020/D1000020"; // License rejected
                 SetStatus(hwnd, message);
@@ -4009,6 +4115,12 @@ DWORD WINAPI WorkerThread(LPVOID param) {
         } else if (error_msg == "invalid_key") {
             return fail_dashboard(L"An unknown error occured: D1000021/D1000021"); // Invalid key
         } else if (error_msg == "hwid_mismatch") {
+            if (TryRequestHwidReset(hwnd, key, hwid_event)) {
+                g_event_token.clear();
+                PostMessageW(hwnd, kMsgProgramsUpdated, 0, 0);
+                EnableButton(true);
+                return 0;
+            }
             return fail_dashboard(L"An unknown error occured: D1000022/D1000022"); // HWID mismatch
         } else if (error_msg == "expired") {
             return fail_dashboard(L"An unknown error occured: D1000023/D1000023"); // Expired

@@ -18,5 +18,8 @@ add_executable(loader WIN32
 )
 
 target_compile_definitions(loader PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
+if (MSVC)
+    target_compile_options(loader PRIVATE /utf-8)
+endif()
 
 target_link_libraries(loader PRIVATE ws2_32 advapi32 bcrypt crypt32 secur32 wintrust comctl32 msimg32 ntdll psapi d2d1 dwrite)
