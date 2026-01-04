@@ -12,8 +12,9 @@ Windows loader app that validates license keys, fetches updates, and injects pay
 1) Server URL and TLS pin
 - Edit `loader/src/app_state.cpp`:
   - `kDefaultServerUrl` (your public server URL)
-  - `kDefaultExpectedThumbprint` (SHA1 thumbprint of your TLS cert, or empty to disable pinning)
+  - `kDefaultExpectedThumbprint` (SHA-256 or SHA-1 thumbprint of your TLS cert)
   - `kLoaderVersion` (keep in sync with server config)
+  - `kDefaultUserAgent` (client user-agent sent to the server)
 
 2) Response signing public key
 - Put your server public key into `loader/encrypt_key.py` (PUBLIC_KEY).
