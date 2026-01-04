@@ -3418,7 +3418,17 @@ void SetRoundedRegion(HWND hwnd, int radius) {
     if (rc.right <= rc.left || rc.bottom <= rc.top) {
         return;
     }
-    HRGN rgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1, radius, radius);
+    int width = rc.right - rc.left;
+    int height = rc.bottom - rc.top;
+    int diameter = radius * 2;
+    int max_diameter = min(width, height);
+    if (diameter > max_diameter) {
+        diameter = max_diameter;
+    }
+    if (diameter < 0) {
+        diameter = 0;
+    }
+    HRGN rgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1, diameter, diameter);
     SetWindowRgn(hwnd, rgn, TRUE);
 }
 

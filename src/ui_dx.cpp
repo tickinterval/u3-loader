@@ -44,6 +44,8 @@ struct Theme {
     D2D1_COLOR_F warn;
 };
 
+constexpr float kWindowCornerRadius = 18.0f;
+
 D2D1_COLOR_F ColorFromHex(uint32_t rgb, float a = 1.0f) {
     float r = static_cast<float>((rgb >> 16) & 0xFF) / 255.0f;
     float g = static_cast<float>((rgb >> 8) & 0xFF) / 255.0f;
@@ -1079,7 +1081,7 @@ void DxUiRendererImpl::DrawBackground() {
 
 void DxUiRendererImpl::DrawPanel() {
     panel_rect_ = D2D1::RectF(0.0f, 0.0f, size_.width, size_.height);
-    const float radius = 18.0f;
+    const float radius = kWindowCornerRadius;
     const float inset = 0.5f;
     D2D1_RECT_F panel_rect = panel_rect_;
     panel_rect.left += inset;
@@ -1135,8 +1137,8 @@ void DxUiRendererImpl::DrawTopBar() {
 
     if (accent_brush_) {
         D2D1_RECT_F accent = bar;
-        accent.left += 18.0f;
-        accent.right -= 18.0f;
+        accent.left += kWindowCornerRadius;
+        accent.right -= kWindowCornerRadius;
         accent.top = bar.bottom - 3.0f;
         accent.bottom = bar.bottom - 2.0f;
         render_target_->FillRectangle(accent, accent_brush_.Get());
