@@ -1,9 +1,14 @@
 #include "injector.h"
 #include <tlhelp32.h>
+#include <bcrypt.h>
 #include <wincrypt.h>
 #include <vector>
 #include <cstring>
 #include <limits>
+
+#ifndef BCRYPT_CHAIN_MODE_CTR
+#define BCRYPT_CHAIN_MODE_CTR L"ChainingModeCTR"
+#endif
 
 // Определения для совместимости
 #ifndef IMAGE_SNAP_BY_ORDINAL
@@ -21,63 +26,140 @@ using NTSTATUS = LONG;
 
 // ================== ENCRYPTION ==================
 
-// RC4 для шифрования DLL в памяти
-class RC4 {
-public:
-    RC4(const BYTE* key, size_t keyLen) {
-        for (int i = 0; i < 256; i++) {
-            S[i] = static_cast<BYTE>(i);
-        }
-        
-        BYTE j = 0;
-        for (int i = 0; i < 256; i++) {
-            j = j + S[i] + key[i % keyLen];
-            std::swap(S[i], S[j]);
-        }
-        
-        i_ = 0;
-        j_ = 0;
+bool GenerateRandomKey(BYTE* key, size_t len) {
+    if (!key || len == 0) {
+        return false;
     }
-    
-    void Process(BYTE* data, size_t len) {
-        for (size_t k = 0; k < len; k++) {
-            i_ = i_ + 1;
-            j_ = j_ + S[i_];
-            std::swap(S[i_], S[j_]);
-            data[k] ^= S[(S[i_] + S[j_]) & 0xFF];
-        }
+    if (len > (std::numeric_limits<ULONG>::max)()) {
+        return false;
     }
-    
-private:
-    BYTE S[256];
-    BYTE i_, j_;
-};
-
-// Генерация случайного ключа
-void GenerateRandomKey(BYTE* key, size_t len) {
+    NTSTATUS status = BCryptGenRandom(nullptr, key, static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (BCRYPT_SUCCESS(status)) {
+        return true;
+    }
     HCRYPTPROV hProv = 0;
-    if (CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        CryptGenRandom(hProv, static_cast<DWORD>(len), key);
-        CryptReleaseContext(hProv, 0);
-    } else {
-        // Fallback: используем GetTickCount и другие источники энтропии
-        for (size_t i = 0; i < len; i++) {
-            key[i] = static_cast<BYTE>((GetTickCount() >> (i % 4) * 8) ^ (i * 0x37) ^ GetCurrentProcessId());
-            Sleep(0);
+    if (len <= (std::numeric_limits<DWORD>::max)()) {
+        if (CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+            bool ok = CryptGenRandom(hProv, static_cast<DWORD>(len), key) != 0;
+            CryptReleaseContext(hProv, 0);
+            if (ok) {
+                return true;
+            }
         }
     }
+    SecureZeroMemory(key, len);
+    return false;
 }
 
-// Шифрование DLL bytes в памяти
-void EncryptDllBytes(std::vector<char>& dll_bytes, BYTE* key, size_t keyLen) {
-    RC4 rc4(key, keyLen);
-    rc4.Process(reinterpret_cast<BYTE*>(dll_bytes.data()), dll_bytes.size());
+bool CryptBufferAesCtr(std::vector<char>& buffer, const BYTE* key, size_t keyLen) {
+    if (!key || buffer.empty()) {
+        return false;
+    }
+    if (keyLen != 16 && keyLen != 24 && keyLen != 32) {
+        return false;
+    }
+    if (buffer.size() > (std::numeric_limits<ULONG>::max)()) {
+        return false;
+    }
+
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_KEY_HANDLE key_handle = nullptr;
+    bool ok = false;
+
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        return false;
+    }
+
+    status = BCryptSetProperty(
+        alg,
+        BCRYPT_CHAINING_MODE,
+        reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_CTR)),
+        sizeof(BCRYPT_CHAIN_MODE_CTR),
+        0);
+    if (!BCRYPT_SUCCESS(status)) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    ULONG object_length = 0;
+    ULONG result_length = 0;
+    status = BCryptGetProperty(
+        alg,
+        BCRYPT_OBJECT_LENGTH,
+        reinterpret_cast<PUCHAR>(&object_length),
+        sizeof(object_length),
+        &result_length,
+        0);
+    if (!BCRYPT_SUCCESS(status) || object_length == 0) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    ULONG block_length = 0;
+    status = BCryptGetProperty(
+        alg,
+        BCRYPT_BLOCK_LENGTH,
+        reinterpret_cast<PUCHAR>(&block_length),
+        sizeof(block_length),
+        &result_length,
+        0);
+    if (!BCRYPT_SUCCESS(status) || block_length == 0) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    std::vector<BYTE> key_object(object_length);
+    status = BCryptGenerateSymmetricKey(
+        alg,
+        &key_handle,
+        key_object.data(),
+        object_length,
+        const_cast<PUCHAR>(key),
+        static_cast<ULONG>(keyLen),
+        0);
+    if (!BCRYPT_SUCCESS(status)) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    std::vector<BYTE> iv(block_length, 0);
+    size_t iv_copy = block_length < keyLen ? block_length : keyLen;
+    memcpy(iv.data(), key, iv_copy);
+
+    std::vector<BYTE> output(buffer.size());
+    ULONG output_length = 0;
+    status = BCryptEncrypt(
+        key_handle,
+        reinterpret_cast<PUCHAR>(buffer.data()),
+        static_cast<ULONG>(buffer.size()),
+        nullptr,
+        iv.data(),
+        static_cast<ULONG>(iv.size()),
+        output.data(),
+        static_cast<ULONG>(output.size()),
+        &output_length,
+        0);
+    if (BCRYPT_SUCCESS(status) && output_length == static_cast<ULONG>(output.size())) {
+        memcpy(buffer.data(), output.data(), output_length);
+        ok = true;
+    }
+
+    if (key_handle) {
+        BCryptDestroyKey(key_handle);
+    }
+    if (alg) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+    }
+    return ok;
 }
 
-// Расшифровка DLL bytes
-void DecryptDllBytes(std::vector<char>& dll_bytes, const BYTE* key, size_t keyLen) {
-    RC4 rc4(key, keyLen);
-    rc4.Process(reinterpret_cast<BYTE*>(dll_bytes.data()), dll_bytes.size());
+bool EncryptDllBytes(std::vector<char>& dll_bytes, const BYTE* key, size_t keyLen) {
+    return CryptBufferAesCtr(dll_bytes, key, keyLen);
+}
+
+bool DecryptDllBytes(std::vector<char>& dll_bytes, const BYTE* key, size_t keyLen) {
+    return CryptBufferAesCtr(dll_bytes, key, keyLen);
 }
 
 // ================== NT API ==================
@@ -450,8 +532,10 @@ static InjectionResult InjectDllInternal(DWORD target_pid, const std::vector<cha
 
     // Шифруем DLL в памяти
     BYTE encryptionKey[32];
-    GenerateRandomKey(encryptionKey, sizeof(encryptionKey));
-    EncryptDllBytes(dll_bytes, encryptionKey, sizeof(encryptionKey));
+    bool encrypted = GenerateRandomKey(encryptionKey, sizeof(encryptionKey));
+    if (encrypted) {
+        encrypted = EncryptDllBytes(dll_bytes, encryptionKey, sizeof(encryptionKey));
+    }
 
     // Открытие процесса
     HANDLE process = OpenProcess(PROCESS_ALL_ACCESS, FALSE, target_pid);
@@ -462,7 +546,15 @@ static InjectionResult InjectDllInternal(DWORD target_pid, const std::vector<cha
     }
 
     // Расшифровываем DLL обратно
-    DecryptDllBytes(dll_bytes, encryptionKey, sizeof(encryptionKey));
+    if (encrypted) {
+        if (!DecryptDllBytes(dll_bytes, encryptionKey, sizeof(encryptionKey))) {
+            SecureZeroMemoryVector(dll_bytes);
+            SecureZeroMemory(encryptionKey, sizeof(encryptionKey));
+            CloseHandle(process);
+            result.error = L"Failed to decrypt DLL bytes";
+            return result;
+        }
+    }
     
     // Затираем ключ
     SecureZeroMemory(encryptionKey, sizeof(encryptionKey));
