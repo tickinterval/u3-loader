@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <string>
 #include <cstdint>
+#include <sddl.h>
 
 namespace loader {
 namespace shared_config {
@@ -36,6 +37,25 @@ struct SharedConfig {
 // Флаги
 #define CONFIG_FLAG_HEARTBEAT_ENABLED   0x0001
 #define CONFIG_FLAG_PROTECTION_ENABLED  0x0002
+inline SECURITY_ATTRIBUTES BuildSecureMappingSecurity(PSECURITY_DESCRIPTOR* out_desc) {
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = FALSE;
+    sa.lpSecurityDescriptor = nullptr;
+    if (out_desc) {
+        *out_desc = nullptr;
+    }
+    const wchar_t* sddl = L"D:P(A;;GA;;;SY)(A;;GA;;;OW)";
+    PSECURITY_DESCRIPTOR desc = nullptr;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &desc, nullptr)) {
+        sa.lpSecurityDescriptor = desc;
+        if (out_desc) {
+            *out_desc = desc;
+        }
+    }
+    return sa;
+}
+
 
 // Генерация уникального обфусцированного имени
 inline std::wstring ObfuscateName(DWORD pid) {
@@ -73,14 +93,19 @@ inline HANDLE WriteConfig(DWORD targetPid, const SharedConfig& config) {
     std::wstring name = GenerateSharedNameForProcess(targetPid);
     
     // Создаём shared memory
+    PSECURITY_DESCRIPTOR desc = nullptr;
+    SECURITY_ATTRIBUTES sa = BuildSecureMappingSecurity(&desc);
     HANDLE mapping = CreateFileMappingW(
         INVALID_HANDLE_VALUE,
-        nullptr,
+        sa.lpSecurityDescriptor ? &sa : nullptr,
         PAGE_READWRITE,
         0,
         sizeof(SharedConfig),
         name.c_str()
     );
+    if (desc) {
+        LocalFree(desc);
+    }
     
     if (!mapping) {
         return nullptr;
@@ -114,13 +139,13 @@ inline bool ReadConfig(SharedConfig* config) {
     std::wstring name = GenerateSharedNameForProcess(currentPid);
     
     // ОТКРЫВАЕМ С ПРАВАМИ ЗАПИСИ ЧТОБЫ ЗАТЕРЕТЬ (WRITE_ACCESS)
-    HANDLE mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name.c_str());
+    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name.c_str());
     if (!mapping) {
         return false;
     }
     
     SharedConfig* shared = reinterpret_cast<SharedConfig*>(
-        MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedConfig))
+        MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(SharedConfig))
     );
     
     if (!shared) {
